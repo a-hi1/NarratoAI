@@ -6,7 +6,7 @@ from html import escape
 from loguru import logger
 from app.config import config
 from webui.components import basic_settings, video_settings, audio_settings, subtitle_settings, script_settings, \
-    system_settings
+    system_settings, cross_border_panel
 # from webui.utils import cache, file_utils
 from app.utils import utils
 from app.utils import ffmpeg_utils
@@ -710,6 +710,9 @@ def main():
     # 渲染系统设置面板
     with panel[2]:
         system_settings.render_system_panel(tr)
+
+    # 跨境本地化解说（独立入口，不塞进短剧/影视分支）
+    cross_border_panel.render_cross_border_panel(tr)
 
     # 放到最后渲染生成按钮和处理逻辑
     render_generate_button()
