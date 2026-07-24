@@ -635,13 +635,13 @@ class PipelineSkeletonTests(unittest.TestCase):
                     "copy_done",
                 ):
                     meta = task_store.transition(meta, st)
-                with mock.patch.dict(os.environ, {"CROSS_BORDER_MATCH_FALLBACK": "1"}):
-                    result = cb_pipeline.step_match(meta)
+                # 默认即启发式；无需 LLM
+                result = cb_pipeline.step_match(meta)
                 self.assertEqual(result["status"], "match_done")
                 script_path = result["artifacts"]["script_json"]
                 with open(script_path, encoding="utf-8") as f:
                     data = json.load(f)
-                self.assertEqual(data.get("match_via"), "heuristic_fallback")
+                self.assertIn(data.get("match_via"), {"heuristic", "heuristic_fallback"})
                 self.assertTrue(data.get("items"))
 
 

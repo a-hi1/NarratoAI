@@ -116,9 +116,9 @@ def _generate_text(
     prompt: str,
     system_prompt: Optional[str] = None,
     *,
-    max_attempts: int = 3,
+    max_attempts: int = 2,
 ) -> str:
-    """调用统一 LLM；对连接类瞬时错误做有限次退避重试。"""
+    """调用统一 LLM；对连接类瞬时错误做有限次短退避（默认 2 次，避免卡死数分钟）。"""
     import time
 
     _ensure_llm_providers()
@@ -138,7 +138,8 @@ def _generate_text(
             last_exc = exc
             if attempt >= attempts or not _is_transient_llm_error(exc):
                 raise
-            delay = min(2 ** attempt, 12)
+            # 短退避：1s / 2s，避免旧逻辑 4min×3 把整条流水线拖死
+            delay = min(attempt, 3)
             logger.warning(
                 f"LLM transient error (attempt {attempt}/{attempts}), "
                 f"retry in {delay}s: {exc}"
@@ -606,47 +607,65 @@ def step_match(meta: Dict[str, Any]) -> Dict[str, Any]:
         subtitle_content=subtitle_content,
         narration_copy=narration_copy,
     )
-    prompt = _render_prompt("script_matching", params)
     target_ratio = float((meta.get("inputs") or {}).get("original_audio_ratio") or 30)
     items: List[Dict[str, Any]] = []
-    match_via = "llm"
+    # 默认启发式（秒级）。LLM 匹配慢且易挂，需质量时再开 CROSS_BORDER_MATCH_LLM=1
+    prefer_llm = os.environ.get("CROSS_BORDER_MATCH_LLM", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     force_fallback = os.environ.get("CROSS_BORDER_MATCH_FALLBACK", "").lower() in {
         "1",
         "true",
         "yes",
     }
-    try:
-        if force_fallback:
-            raise RuntimeError("CROSS_BORDER_MATCH_FALLBACK forced")
-        # match 提示词较长，瞬时失败时少重试，尽快走启发式回退
-        raw = _generate_text(
-            prompt,
-            system_prompt=_system_prompt("script_matching"),
-            max_attempts=2,
+    match_via = "heuristic"
+    llm_error: Optional[str] = None
+
+    def _heuristic_items() -> List[Dict[str, Any]]:
+        srt_path = source_srt if os.path.isfile(source_srt) else ""
+        srt_text = read_subtitle_text(srt_path).text if srt_path else ""
+        if not srt_text.strip():
+            srt_text = subtitle_content
+        return _fallback_script_items(
+            narration_copy,
+            srt_text,
+            _video_basename(meta),
+            target_original_ratio=target_ratio,
         )
-        data = _extract_json(raw)
-        raw_items = data.get("items") if isinstance(data, dict) else data
-        if not isinstance(raw_items, list) or not raw_items:
-            raise ValueError("script items empty")
-        items = _normalize_script_items(raw_items, _video_basename(meta))
-        if not items:
-            raise ValueError("script items empty after normalize")
-    except Exception as exc:
-        append_log(meta, f"script_matching LLM failed, heuristic fallback: {exc}", level="WARNING")
+
+    if prefer_llm and not force_fallback:
+        prompt = _render_prompt("script_matching", params)
         try:
-            srt_path = source_srt if os.path.isfile(source_srt) else ""
-            srt_text = read_subtitle_text(srt_path).text if srt_path else ""
-            if not srt_text.strip():
-                srt_text = subtitle_content
-            items = _fallback_script_items(
-                narration_copy,
-                srt_text,
-                _video_basename(meta),
-                target_original_ratio=target_ratio,
+            raw = _generate_text(
+                prompt,
+                system_prompt=_system_prompt("script_matching"),
+                max_attempts=1,
             )
-            match_via = "heuristic_fallback"
+            data = _extract_json(raw)
+            raw_items = data.get("items") if isinstance(data, dict) else data
+            if not isinstance(raw_items, list) or not raw_items:
+                raise ValueError("script items empty")
+            items = _normalize_script_items(raw_items, _video_basename(meta))
+            if not items:
+                raise ValueError("script items empty after normalize")
+            match_via = "llm"
+        except Exception as exc:
+            llm_error = str(exc)
+            append_log(
+                meta,
+                f"script_matching LLM failed, heuristic fallback: {exc}",
+                level="WARNING",
+            )
+
+    if not items:
+        try:
+            items = _heuristic_items()
+            match_via = "heuristic_fallback" if llm_error else "heuristic"
         except Exception as exc2:
-            return _set_failed(meta, f"script_matching failed: {exc}; fallback: {exc2}", step="match")
+            detail = f"{llm_error}; fallback: {exc2}" if llm_error else str(exc2)
+            return _set_failed(meta, f"script_matching failed: {detail}", step="match")
     if not items:
         return _set_failed(meta, "script_matching produced no items", step="match")
     append_log(meta, f"script matched via {match_via}: {len(items)} items")
@@ -968,14 +987,27 @@ def step_packaging(meta: Dict[str, Any]) -> Dict[str, Any]:
 
     inputs = meta.get("inputs") or {}
     pack_payload: Dict[str, Any]
+    # 默认本地标题包装（秒级）；需要 LLM 质量时设 CROSS_BORDER_PACKAGING_LLM=1
+    prefer_llm_pack = os.environ.get("CROSS_BORDER_PACKAGING_LLM", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    pack_via = "fallback"
     try:
+        if not prefer_llm_pack:
+            raise RuntimeError("local packaging preferred")
         params = _prompt_params(
             meta,
             source_digest=digest,
             narration_copy=narration_copy,
         )
         prompt = _render_prompt("title_packaging", params)
-        raw = _generate_text(prompt, system_prompt=_system_prompt("title_packaging"))
+        raw = _generate_text(
+            prompt,
+            system_prompt=_system_prompt("title_packaging"),
+            max_attempts=1,
+        )
         data = _extract_json(raw)
         pack_payload = packaging_mod.build_packaging_payload(
             direction=meta.get("direction") or "inbound",
@@ -991,9 +1023,13 @@ def step_packaging(meta: Dict[str, Any]) -> Dict[str, Any]:
             script_items=script_items,
             original_audio_ratio_target=float(inputs.get("original_audio_ratio") or 30),
         )
+        pack_via = "llm"
         append_log(meta, "title packaging via LLM")
     except Exception as exc:
-        append_log(meta, f"title packaging fallback: {exc}", level="WARNING")
+        if prefer_llm_pack:
+            append_log(meta, f"title packaging fallback: {exc}", level="WARNING")
+        else:
+            append_log(meta, "title packaging via local fallback (fast path)")
         fb = packaging_mod.fallback_titles_from_copy(
             meta.get("direction") or "inbound", narration_copy
         )
