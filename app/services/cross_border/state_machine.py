@@ -38,9 +38,12 @@ def _done(step: str) -> str:
 
 
 # 合法边：from -> frozenset(to)
+# queued 允许直接进入任意步骤的 running，便于失败后从中途步重试
 _TRANSITIONS: Dict[str, FrozenSet[str]] = {
     "draft": frozenset({"queued", "cancelled"}),
-    "queued": frozenset({_running("asr"), "cancelled", "failed"}),
+    "queued": frozenset(
+        {_running(step) for step in PIPELINE_STEPS} | {"cancelled", "failed"}
+    ),
 }
 
 for i, step in enumerate(PIPELINE_STEPS):

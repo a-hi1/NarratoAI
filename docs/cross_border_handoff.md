@@ -51,14 +51,17 @@ git push fork feat/cross-border-narration-mvp
 | **W3** | 文案层 In/Out + 6 风格包 + copy 审核门 | ✅（合在 W1） |
 | **W4** | 脚本匹配 OST + TTS（voice 服务） | ✅ `e8543b1` |
 | **W5** | 真成片 render + 包装导出 | ✅ `097e708` |
-| **W6** | 稳态：重试/超时/压测/任务列表体验 | ⬜ 未做 |
+| **W6** | 稳态：重试/超时/错误步保留/LLM 回退 | 🟡 进行中（失败步保留 + LLM 重试 + match 启发式回退已落地；压测/列表体验未做） |
 | **W7** | 真片 In+Out 打磨 prompt / 风格 | ⬜ 未做 |
 | **W8** | 商业化包装 | ⬜ 未做 |
 
+**已验证：** Inbound 真片 E2E（`测试.mp4` + 上传 SRT）可跑到 `completed`，成片在 `export/output.mp4`。  
+match 在 LLM 不稳时可用 `CROSS_BORDER_MATCH_FALLBACK=1` 强制启发式，或自动回退。
+
 **建议下一优先级：**  
-1）真片 E2E（`测试.mp4` + 上传 SRT 跳过 ASR）  
-2）W6 稳态  
-3）Outbound 一条完整验证  
+1）Outbound 一条完整验证（中文片 → 英文解说）  
+2）W6 剩余：任务列表体验 / 超时可视化 / 压测  
+3）W7 真片 prompt / 风格打磨
 
 ---
 
@@ -106,7 +109,7 @@ app/services/prompts/cross_border_narration/
 webui/components/cross_border_panel.py   # 新建 / 详情 / 列表
 webui.py                                 # 主界面下方挂载面板
 
-app/services/test_cross_border_unittest.py  # 22 个单测（mock LLM/ASR）
+app/services/test_cross_border_unittest.py  # 26 个单测（mock LLM/ASR）
 ```
 
 ### 复用的主站能力（不要重复造轮子）
@@ -173,7 +176,10 @@ WebUI（中文优先，工作流 Tab）：
 - 系统 Python 无依赖 → 必须用 `.venv/Scripts/python`。  
 - `origin` 是上游，`fork` 才是用户仓库。  
 - `gh` 可能未登录；HTTPS push 若失败让用户 `! gh auth login`。  
-- 真实 LLM Key 可能 401（`API_KEY_DISABLED`）；单测必须 mock `_generate_text` / 相关 step。  
+- 真实 LLM Key 可能 401（`API_KEY_DISABLED`）或 Connection error；单测必须 mock `_generate_text`。  
+- `pipeline._ensure_llm_providers` 必须从 `app.services.llm.providers` 导入（不是 `app.services.llm`）。  
+- failed 后 `error.step` 必须保留失败步；`queued` 允许进入任意 `*_running` 以便中途重试。  
+- match 提示词长、LLM 易超时 → 自动启发式回退；调试可 `CROSS_BORDER_MATCH_FALLBACK=1`。  
 - Streamlit 长任务勿同步阻塞 → 后台线程 + `meta.json` 轮询（可选 `streamlit_autorefresh`）。  
 - render 依赖 ffmpeg；失败时 `step_render` 回退骨架，流水线仍可 packaging。  
 - 翻译/API 路径勿把 `config.toml` 打进 commit。
@@ -208,10 +214,10 @@ WebUI（中文优先，工作流 Tab）：
 - 单测：app/services/test_cross_border_unittest.py（22 tests，用 .venv/Scripts/python 跑）
 
 ## 进度
-W1–W5 已完成并 push 到 fork。下一步优先：
-1) 真片 E2E（测试.mp4，可上传 SRT）
-2) W6 稳态（重试/超时/错误体验）
-3) Outbound 真片验证
+W1–W5 已完成；Inbound 真片 E2E 已跑通 completed。W6 部分完成（失败步保留、LLM 重试、match 启发式回退）。下一步优先：
+1) Outbound 真片验证
+2) W6 剩余（列表体验/超时可视化）
+3) W7 prompt / 风格打磨
 
 ## 约束
 - 匹配现有代码风格；优先复用主站 voice/fun_asr/clip/merge，不重造轮子

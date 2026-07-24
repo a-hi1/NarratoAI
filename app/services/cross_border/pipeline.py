@@ -60,35 +60,92 @@ _lock = threading.Lock()
 _running_threads: Dict[str, threading.Thread] = {}
 
 
-def _set_failed(meta: Dict[str, Any], message: str) -> Dict[str, Any]:
+def _set_failed(
+    meta: Dict[str, Any],
+    message: str,
+    step: Optional[str] = None,
+) -> Dict[str, Any]:
+    # 优先保留调用方指定步 / 当前 step / status 推导步，避免 error.step 为 null
+    failed_step = step or meta.get("step")
+    if not failed_step:
+        status = str(meta.get("status") or "")
+        if status.endswith("_running") or status.endswith("_done"):
+            failed_step = status.rsplit("_", 1)[0]
+    if failed_step:
+        meta["step"] = failed_step
     append_log(meta, message, level="ERROR")
     try:
         return transition(meta, "failed", error=message)
     except InvalidTransitionError:
         meta["status"] = "failed"
-        meta["error"] = {"step": meta.get("step"), "message": message}
+        meta["error"] = {"step": meta.get("step") or failed_step, "message": message}
         return save_meta(meta)
 
 
 def _ensure_llm_providers():
     try:
-        from app.services.llm import register_all_providers
+        # 正确路径是 providers 子包；app.services.llm 本身不导出该函数
+        from app.services.llm.providers import register_all_providers
 
         register_all_providers()
     except Exception as exc:
         logger.warning(f"register_all_providers skipped: {exc}")
 
 
-def _generate_text(prompt: str, system_prompt: Optional[str] = None) -> str:
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    needles = (
+        "connection error",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "429",
+        "rate limit",
+        "502",
+        "503",
+        "504",
+        "server error",
+        "remote protocol",
+        "ssl",
+    )
+    return any(n in text for n in needles)
+
+
+def _generate_text(
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    *,
+    max_attempts: int = 3,
+) -> str:
+    """调用统一 LLM；对连接类瞬时错误做有限次退避重试。"""
+    import time
+
     _ensure_llm_providers()
     from app.services.llm.migration_adapter import _run_async_safely
     from app.services.llm.unified_service import UnifiedLLMService
 
-    return _run_async_safely(
-        UnifiedLLMService.generate_text,
-        prompt=prompt,
-        system_prompt=system_prompt,
-    )
+    last_exc: Optional[BaseException] = None
+    attempts = max(1, int(max_attempts or 1))
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_async_safely(
+                UnifiedLLMService.generate_text,
+                prompt=prompt,
+                system_prompt=system_prompt,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_transient_llm_error(exc):
+                raise
+            delay = min(2 ** attempt, 12)
+            logger.warning(
+                f"LLM transient error (attempt {attempt}/{attempts}), "
+                f"retry in {delay}s: {exc}"
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _extract_json(text: str) -> Any:
@@ -351,6 +408,160 @@ def step_copy(meta: Dict[str, Any]) -> Dict[str, Any]:
     return transition(meta, "copy_done")
 
 
+_SRT_BLOCK_RE = re.compile(
+    r"(?m)^\s*(\d+)\s*\n"
+    r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*\n"
+    r"([\s\S]*?)(?=\n\s*\d+\s*\n\d{2}:\d{2}:\d{2}|\Z)"
+)
+_NARRATION_SPLIT_RE = re.compile(r"(?<=[。！？!?\n])\s+|\n+")
+_OST_HINT_RE = re.compile(
+    r"(爆炸|炸|按钮|按下|boom|blow|press|explosion|原片|原声)",
+    re.IGNORECASE,
+)
+
+
+def _parse_srt_cues(srt_text: str) -> List[Dict[str, str]]:
+    """轻量解析 SRT 为 [{start,end,text}]，供 match 回退使用。"""
+    text = (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    cues: List[Dict[str, str]] = []
+    for match in _SRT_BLOCK_RE.finditer(text + "\n"):
+        start = match.group(2).replace(".", ",")
+        end = match.group(3).replace(".", ",")
+        body = re.sub(r"\s+", " ", (match.group(4) or "").strip())
+        cues.append({"start": start, "end": end, "text": body})
+    return cues
+
+
+def _split_narration_lines(narration_copy: str) -> List[str]:
+    raw = (narration_copy or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in _NARRATION_SPLIT_RE.split(raw) if p and p.strip()]
+    # 合并过短碎片，避免 TTS 碎成一堆单字
+    merged: List[str] = []
+    buf = ""
+    for part in parts:
+        candidate = f"{buf}{part}".strip() if buf else part
+        if len(candidate) < 8 and not candidate.endswith(("。", "！", "？", "!", "?")):
+            buf = candidate
+            continue
+        if buf and len(part) < 4:
+            merged.append(f"{buf}{part}".strip())
+            buf = ""
+            continue
+        if buf:
+            merged.append(buf)
+            buf = ""
+        merged.append(part)
+    if buf:
+        if merged:
+            merged[-1] = f"{merged[-1]}{buf}".strip()
+        else:
+            merged.append(buf)
+    return [m for m in merged if m]
+
+
+def _fallback_script_items(
+    narration_copy: str,
+    srt_text: str,
+    video_name: str,
+    *,
+    target_original_ratio: float = 30.0,
+) -> List[Dict[str, Any]]:
+    """
+    LLM 匹配失败时的启发式脚本：
+    - 按句切解说
+    - 均分映射到源字幕时间轴
+    - 命中爆炸/按钮等高能词的字幕段插入 OST=1
+    """
+    lines = _split_narration_lines(narration_copy)
+    cues = _parse_srt_cues(srt_text)
+    if not lines:
+        raise ValueError("empty narration for fallback match")
+    if not cues:
+        # 无字幕时整段用默认时间窗
+        items = []
+        for i, line in enumerate(lines, start=1):
+            items.append(
+                {
+                    "_id": i,
+                    "video_id": 1,
+                    "video_name": video_name,
+                    "timestamp": "00:00:00,000-00:00:03,000",
+                    "picture": "fallback window",
+                    "narration": line,
+                    "OST": 0,
+                }
+            )
+        return _normalize_script_items(items, video_name)
+
+    # 高能原片候选
+    ost_cues = [c for c in cues if _OST_HINT_RE.search(c.get("text") or "")]
+    # 控制 OST 占比：最多约 target_ratio 对应的条数（粗）
+    max_ost = max(1, int(round(len(cues) * max(0.0, target_original_ratio) / 100.0))) if cues else 0
+    ost_cues = ost_cues[:max_ost] if max_ost else []
+
+    items: List[Dict[str, Any]] = []
+    n_lines = len(lines)
+    n_cues = len(cues)
+    for i, line in enumerate(lines):
+        # 线性映射到字幕索引
+        cue_idx = min(n_cues - 1, int(i * n_cues / max(1, n_lines)))
+        cue = cues[cue_idx]
+        items.append(
+            {
+                "_id": len(items) + 1,
+                "video_id": 1,
+                "video_name": video_name,
+                "timestamp": f"{cue['start']}-{cue['end']}",
+                "picture": cue.get("text") or "",
+                "narration": line,
+                "OST": 0,
+            }
+        )
+        # 在对应高能字幕后插入原片
+        for ost in ost_cues:
+            if ost is cue or (
+                ost["start"] == cue["start"] and ost["end"] == cue["end"]
+            ):
+                items.append(
+                    {
+                        "_id": len(items) + 1,
+                        "video_id": 1,
+                        "video_name": video_name,
+                        "timestamp": f"{ost['start']}-{ost['end']}",
+                        "picture": ost.get("text") or "high-energy original",
+                        "narration": f"播放原片{len(items) + 1}",
+                        "OST": 1,
+                    }
+                )
+                # 每个 ost cue 只插一次
+                ost_cues = [x for x in ost_cues if x is not ost]
+                break
+
+    # 若完全没插到 OST，把最后一条高能字幕补上
+    if not any(int(x.get("OST", 0) or 0) == 1 for x in items):
+        seed = next((c for c in cues if _OST_HINT_RE.search(c.get("text") or "")), None)
+        if seed is None and len(cues) >= 2:
+            seed = cues[min(len(cues) - 1, max(0, len(cues) // 2))]
+        if seed is not None:
+            items.append(
+                {
+                    "_id": len(items) + 1,
+                    "video_id": 1,
+                    "video_name": video_name,
+                    "timestamp": f"{seed['start']}-{seed['end']}",
+                    "picture": seed.get("text") or "original",
+                    "narration": f"播放原片{len(items) + 1}",
+                    "OST": 1,
+                }
+            )
+
+    return _normalize_script_items(items, video_name)
+
+
 def _normalize_script_items(items: List[Any], video_name: str) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for i, item in enumerate(items, start=1):
@@ -396,21 +607,52 @@ def step_match(meta: Dict[str, Any]) -> Dict[str, Any]:
         narration_copy=narration_copy,
     )
     prompt = _render_prompt("script_matching", params)
+    target_ratio = float((meta.get("inputs") or {}).get("original_audio_ratio") or 30)
+    items: List[Dict[str, Any]] = []
+    match_via = "llm"
+    force_fallback = os.environ.get("CROSS_BORDER_MATCH_FALLBACK", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     try:
-        raw = _generate_text(prompt, system_prompt=_system_prompt("script_matching"))
+        if force_fallback:
+            raise RuntimeError("CROSS_BORDER_MATCH_FALLBACK forced")
+        # match 提示词较长，瞬时失败时少重试，尽快走启发式回退
+        raw = _generate_text(
+            prompt,
+            system_prompt=_system_prompt("script_matching"),
+            max_attempts=2,
+        )
         data = _extract_json(raw)
-        items = data.get("items") if isinstance(data, dict) else data
-        if not isinstance(items, list) or not items:
+        raw_items = data.get("items") if isinstance(data, dict) else data
+        if not isinstance(raw_items, list) or not raw_items:
             raise ValueError("script items empty")
-        items = _normalize_script_items(items, _video_basename(meta))
+        items = _normalize_script_items(raw_items, _video_basename(meta))
         if not items:
             raise ValueError("script items empty after normalize")
     except Exception as exc:
-        return _set_failed(meta, f"script_matching failed: {exc}")
+        append_log(meta, f"script_matching LLM failed, heuristic fallback: {exc}", level="WARNING")
+        try:
+            srt_path = source_srt if os.path.isfile(source_srt) else ""
+            srt_text = read_subtitle_text(srt_path).text if srt_path else ""
+            if not srt_text.strip():
+                srt_text = subtitle_content
+            items = _fallback_script_items(
+                narration_copy,
+                srt_text,
+                _video_basename(meta),
+                target_original_ratio=target_ratio,
+            )
+            match_via = "heuristic_fallback"
+        except Exception as exc2:
+            return _set_failed(meta, f"script_matching failed: {exc}; fallback: {exc2}", step="match")
+    if not items:
+        return _set_failed(meta, "script_matching produced no items", step="match")
+    append_log(meta, f"script matched via {match_via}: {len(items)} items")
 
     from . import compliance as compliance_mod
 
-    target_ratio = float((meta.get("inputs") or {}).get("original_audio_ratio") or 30)
     actual_ratio = compliance_mod.estimate_original_audio_ratio(items)
     meta["artifacts"]["ost_ratio"] = actual_ratio
     if actual_ratio >= 0:
@@ -437,6 +679,7 @@ def step_match(meta: Dict[str, Any]) -> Dict[str, Any]:
             "items": items,
             "ost_ratio": actual_ratio,
             "target_original_audio_ratio": target_ratio,
+            "match_via": match_via,
         },
     )
     meta["artifacts"]["script_json"] = path
@@ -798,12 +1041,16 @@ def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional
     if start_step not in PIPELINE_STEPS:
         raise ValueError(f"unknown step: {start_step}")
 
-    # 入队
+    # 入队 / 失败恢复：
+    # - draft/cancelled 必须先 queued
+    # - failed 若从 asr 整段重跑也走 queued；从中途步重跑可直接 {step}_running
+    #   （queued 现已允许任意 step_running，统一先 queued 更简单）
     if meta.get("status") in {None, "draft", "failed", "cancelled"}:
         try:
             meta = transition(meta, "queued")
         except InvalidTransitionError:
             meta["status"] = "queued"
+            meta["error"] = None
             save_meta(meta)
 
     started = False
@@ -820,9 +1067,19 @@ def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional
             meta = handler(meta)
         except Exception as exc:
             logger.exception(f"cross_border step {step} crashed")
-            return _set_failed(meta, f"{step} crashed: {exc}\n{traceback.format_exc()[-500:]}")
+            return _set_failed(
+                meta,
+                f"{step} crashed: {exc}\n{traceback.format_exc()[-500:]}",
+                step=step,
+            )
 
         if meta.get("status") == "failed":
+            # 兜底：handler 内 _set_failed 若未带 step，这里补上
+            err = meta.get("error") or {}
+            if not err.get("step"):
+                meta["error"] = {**err, "step": step, "message": err.get("message") or "failed"}
+                meta["step"] = step
+                save_meta(meta)
             return meta
         if stop_after and step == stop_after:
             return meta

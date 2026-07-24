@@ -349,13 +349,19 @@ def append_log(meta: Dict[str, Any], message: str, level: str = "INFO") -> Dict[
 
 
 def transition(meta: Dict[str, Any], target_status: str, error: Optional[str] = None) -> Dict[str, Any]:
+    prev_step = meta.get("step")
     result = assert_transition(meta.get("status") or "draft", target_status)
     meta["status"] = result.status
-    meta["step"] = result.step
+    # failed 时 step_of 为 None，需保留失败前步骤，方便 UI「从失败步重试」
+    if result.status == "failed":
+        meta["step"] = prev_step or result.step
+    else:
+        meta["step"] = result.step
     if result.progress >= 0:
         meta["progress"] = result.progress
     if error:
-        meta["error"] = {"step": result.step or meta.get("step"), "message": error}
+        failed_step = meta.get("step") or prev_step
+        meta["error"] = {"step": failed_step, "message": error}
         append_log(meta, error, level="ERROR")
     elif result.status != "failed":
         meta["error"] = None

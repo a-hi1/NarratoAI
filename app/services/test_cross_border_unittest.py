@@ -70,6 +70,10 @@ class StateMachineTests(unittest.TestCase):
 
     def test_failed_retry(self):
         state_machine.assert_transition("failed", "digest_running")
+        # 失败后常先回 queued，再从任意步继续
+        state_machine.assert_transition("failed", "queued")
+        state_machine.assert_transition("queued", "copy_running")
+        state_machine.assert_transition("queued", "match_running")
 
 
 class ComplianceTests(unittest.TestCase):
@@ -177,6 +181,26 @@ class TaskStoreTests(unittest.TestCase):
                     meta = task_store.transition(meta, "queued")
                 self.assertEqual(meta["status"], "queued")
                 self.assertGreaterEqual(calls["n"], 3)
+
+    def test_failed_keeps_step_for_retry(self):
+        """failed 后 error.step / meta.step 仍指向失败前步骤，供 UI 重试。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=os.path.join(tmp, "a.mp4"),
+                    video_title="失败步保留",
+                )
+                meta = task_store.transition(meta, "queued")
+                meta = task_store.transition(meta, "asr_running")
+                meta = task_store.transition(meta, "asr_done")
+                meta = task_store.transition(meta, "translate_running")
+                self.assertEqual(meta["step"], "translate")
+                meta = task_store.transition(meta, "failed", error="boom")
+                self.assertEqual(meta["status"], "failed")
+                self.assertEqual(meta["step"], "translate")
+                self.assertEqual((meta.get("error") or {}).get("step"), "translate")
+                self.assertIn("boom", (meta.get("error") or {}).get("message") or "")
 
 
 class PackagingTests(unittest.TestCase):
@@ -564,6 +588,61 @@ class PipelineSkeletonTests(unittest.TestCase):
         self.assertTrue(items[1]["narration"].startswith("播放原片"))
         self.assertEqual(items[2]["OST"], 0)
         self.assertEqual(items[2]["narration"], "正常解说")
+
+    def test_fallback_script_items_and_forced_match(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        srt = (
+            "1\n00:00:00,000 --> 00:00:03,000\nHello book promo\n\n"
+            "2\n00:00:03,000 --> 00:00:06,000\nDon't press that button yet\n\n"
+            "3\n00:00:06,000 --> 00:00:09,000\nWe will blow up something\n"
+        )
+        copy = "他为了卖书直接炸了舞台。\n先别按那个按钮。\n整本书都是高能。"
+        items = cb_pipeline._fallback_script_items(
+            copy, srt, "demo.mp4", target_original_ratio=30
+        )
+        self.assertGreaterEqual(len(items), 3)
+        self.assertTrue(any(int(i.get("OST", 0) or 0) == 1 for i in items))
+        self.assertTrue(all(i.get("timestamp") for i in items))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=os.path.join(tmp, "demo.mp4"),
+                )
+                task_store.write_text_artifact(meta["task_id"], "source.srt", srt)
+                task_store.write_text_artifact(meta["task_id"], "digest.md", "# d\n")
+                task_store.write_text_artifact(meta["task_id"], "narration_copy.txt", copy)
+                meta["artifacts"]["source_srt"] = task_store.artifact_path(
+                    meta["task_id"], "source.srt"
+                )
+                meta["artifacts"]["digest"] = task_store.artifact_path(
+                    meta["task_id"], "digest.md"
+                )
+                meta["artifacts"]["narration_copy"] = task_store.artifact_path(
+                    meta["task_id"], "narration_copy.txt"
+                )
+                for st in (
+                    "queued",
+                    "asr_running",
+                    "asr_done",
+                    "translate_running",
+                    "translate_done",
+                    "digest_running",
+                    "digest_done",
+                    "copy_running",
+                    "copy_done",
+                ):
+                    meta = task_store.transition(meta, st)
+                with mock.patch.dict(os.environ, {"CROSS_BORDER_MATCH_FALLBACK": "1"}):
+                    result = cb_pipeline.step_match(meta)
+                self.assertEqual(result["status"], "match_done")
+                script_path = result["artifacts"]["script_json"]
+                with open(script_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(data.get("match_via"), "heuristic_fallback")
+                self.assertTrue(data.get("items"))
 
 
 class RenderHelperTests(unittest.TestCase):

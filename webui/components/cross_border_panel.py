@@ -161,6 +161,26 @@ def _friendly_error(message: Any) -> str:
         )
     if "placeholder" in low or "占位" in text:
         return f"{text}\n\n提示：可上传源字幕后点「仅重跑 ASR→翻译」。"
+    if (
+        "connection error" in low
+        or "api_call_error" in low
+        or "timed out" in low
+        or "timeout" in low
+        or "rate limit" in low
+        or "提供商未注册" in text
+    ):
+        return (
+            "大模型调用失败（网络抖动 / 超时 / 未注册 provider）。"
+            "流水线已对瞬时错误自动重试；脚本匹配失败会走启发式回退。"
+            "请点「从失败步重试」。"
+            f"\n\n技术详情：{text}"
+        )
+    if "illegal transition" in low:
+        return (
+            "状态机迁移异常（多见于失败后从中途步重试）。"
+            "已放宽 queued→任意步骤，请再点「从失败步重试」。"
+            f"\n\n技术详情：{text}"
+        )
     return text
 
 
