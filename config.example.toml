@@ -296,6 +296,9 @@
     silence_duration = 0.125
 
 [ui]
+    # 界面语言（中文优先工具；可选 zh / en）
+    language = "zh"
+
     # TTS引擎选择 (indextts, indextts2, omnivoice, edge_tts, qwen3_tts, tencent_tts, doubaotts, azure_speech)
     tts_engine = "indextts"
 

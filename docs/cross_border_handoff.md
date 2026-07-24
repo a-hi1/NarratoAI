@@ -147,8 +147,12 @@ cd D:/zhuomian/Github/NarratoAI
 配置：`config.toml`（参考 `config.example.toml` 的 `[fun_asr]`、TTS、文本 LLM）。  
 **切勿把真实 Key 提交进 git。**
 
-WebUI：主流程三列下方 → **🌍 跨境本地化解说（MVP）**  
-tabs：新建任务 / 任务详情 / 任务列表。
+WebUI（中文优先，工作流 Tab）：
+- **🎬 影视 / 短剧解说** — 脚本 · 配音 · 画面字幕 + 底部「成片与导出」
+- **🌍 跨境本地化** — 新建 / 详情（步骤条） / 任务列表
+- **⚙️ 基础与系统** — 语言、模型、代理、系统设置
+
+默认界面语言 `zh`；`page_title` 为「NarratoAI 影视解说工坊」。
 
 ---
 

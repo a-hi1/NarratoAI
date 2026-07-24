@@ -14,24 +14,114 @@ from app.models import const
 from app.models.schema import VideoClipParams, VideoAspect
 
 
-# 初始化配置 - 必须是第一个 Streamlit 命令
+# 初始化配置 - 必须是第一个 Streamlit 命令（中文优先工具）
 st.set_page_config(
-    page_title="NarratoAI",
+    page_title="NarratoAI 影视解说工坊",
     page_icon="📽️",
     layout="wide",
     initial_sidebar_state="auto",
     menu_items={
         "Report a bug": "https://github.com/linyqh/NarratoAI/issues",
-        'About': f"# Narrato:blue[AI] :sunglasses: 📽️ \n #### Version: v{config.project_version} \n "
-                 f"自动化影视解说视频详情请移步：https://github.com/linyqh/NarratoAI"
+        "About": (
+            f"# NarratoAI 影视解说工坊 📽️\n"
+            f"#### 版本: v{config.project_version}\n"
+            f"一站式 AI 影视解说 · 短剧混剪 · 跨境本地化\n\n"
+            f"项目主页：https://github.com/linyqh/NarratoAI"
+        ),
     },
 )
 
-# 设置页面样式
-hide_streamlit_style = """
-<style>#root > div:nth-child(1) > div > div > div > div > section > div {padding-top: 2rem; padding-bottom: 10px; padding-left: 20px; padding-right: 20px;}</style>
+# 页面样式：收紧顶距 + 工作流卡片 + 操作区
+APP_CUSTOM_CSS = """
+<style>
+/* 主区域内边距 */
+#root > div:nth-child(1) > div > div > div > div > section > div {
+    padding-top: 1.2rem;
+    padding-bottom: 2.5rem;
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+}
+/* 顶部标题区 */
+.narrato-hero {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 0.75rem 1.5rem;
+    margin: 0 0 1rem 0;
+    padding: 0.85rem 1.1rem;
+    border: 1px solid rgba(49, 51, 63, 0.12);
+    border-radius: 12px;
+    background: linear-gradient(135deg, rgba(255,75,75,0.08), rgba(49,130,246,0.06) 55%, rgba(255,255,255,0.9));
+}
+.narrato-hero-title {
+    font-size: 1.55rem;
+    font-weight: 750;
+    color: #1f2430;
+    line-height: 1.3;
+    margin: 0;
+}
+.narrato-hero-title span {
+    color: #ff4b4b;
+}
+.narrato-hero-sub {
+    margin: 0.25rem 0 0 0;
+    color: #5f6575;
+    font-size: 0.92rem;
+    line-height: 1.45;
+}
+.narrato-hero-meta {
+    color: #7a8192;
+    font-size: 0.82rem;
+    white-space: nowrap;
+}
+/* 工作流引导条 */
+.narrato-guide {
+    margin: 0 0 0.85rem 0;
+    padding: 0.65rem 0.9rem;
+    border-left: 4px solid #ff4b4b;
+    border-radius: 0 8px 8px 0;
+    background: rgba(255, 75, 75, 0.06);
+    color: #3a3f4b;
+    font-size: 0.92rem;
+    line-height: 1.5;
+}
+/* 分栏小标题 */
+.narrato-col-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #323846;
+    margin: 0 0 0.4rem 0;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid rgba(49, 51, 63, 0.1);
+}
+/* 底部操作区 */
+.narrato-action-bar {
+    margin-top: 1rem;
+    padding: 0.9rem 1rem 0.4rem;
+    border: 1px solid rgba(49, 51, 63, 0.12);
+    border-radius: 12px;
+    background: #fafbfd;
+}
+.narrato-action-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #202534;
+    margin: 0 0 0.2rem 0;
+}
+.narrato-action-hint {
+    color: #6b7280;
+    font-size: 0.88rem;
+    margin: 0 0 0.75rem 0;
+    line-height: 1.45;
+}
+/* Tab 标签更醒目 */
+button[data-baseweb="tab"] {
+    font-weight: 600 !important;
+}
+</style>
 """
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+st.markdown(APP_CUSTOM_CSS, unsafe_allow_html=True)
 
 
 def init_log():
@@ -112,14 +202,19 @@ def init_log():
 
 
 def init_global_state():
-    """初始化全局状态"""
+    """初始化全局状态（界面默认中文）"""
     if 'video_clip_json' not in st.session_state:
         st.session_state['video_clip_json'] = []
     if 'video_plot' not in st.session_state:
         st.session_state['video_plot'] = ''
     if 'ui_language' not in st.session_state:
-        st.session_state['ui_language'] = config.ui.get("language", utils.get_system_locale())
-    # 移除subclip_videos初始化 - 现在使用统一裁剪策略
+        # 中文优先：配置 > 会话；无效时回退 zh（不再跟系统 locale 强制英文）
+        lang = (config.ui.get("language") or "zh").strip() or "zh"
+        if lang.lower().startswith("zh"):
+            lang = "zh"
+        st.session_state['ui_language'] = lang
+        if not config.ui.get("language"):
+            config.ui["language"] = lang
 
 
 def tr(key):
@@ -650,13 +745,77 @@ def render_export_jianying_button():
 
 
 
+def _render_app_header():
+    """中文优先的顶部标题区。"""
+    version = escape(str(config.project_version or ""))
+    title = escape(tr("App Title"))
+    subtitle = escape(tr("App Subtitle"))
+    st.markdown(
+        f"""
+        <div class="narrato-hero">
+            <div>
+                <div class="narrato-hero-title">📽️ {title.replace("NarratoAI", "Narrato<span>AI</span>", 1)}</div>
+                <p class="narrato-hero-sub">{subtitle}</p>
+            </div>
+            <div class="narrato-hero-meta">v{version}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander(tr("About and Help"), expanded=False):
+        st.markdown(get_help_text())
+
+
+def _render_narration_workspace():
+    """影视 / 短剧解说工作台：脚本 · 配音 · 画面字幕 + 成片操作。"""
+    st.markdown(
+        f'<div class="narrato-guide">{escape(tr("Workflow Guide Narration"))}</div>',
+        unsafe_allow_html=True,
+    )
+
+    panel = st.columns([1.15, 1, 1])
+    with panel[0]:
+        st.markdown(
+            f'<div class="narrato-col-title">{escape(tr("Script Column Panel"))}</div>',
+            unsafe_allow_html=True,
+        )
+        script_settings.render_script_panel(tr)
+    with panel[1]:
+        st.markdown(
+            f'<div class="narrato-col-title">{escape(tr("Audio Column Panel"))}</div>',
+            unsafe_allow_html=True,
+        )
+        audio_settings.render_audio_panel(tr)
+    with panel[2]:
+        st.markdown(
+            f'<div class="narrato-col-title">{escape(tr("Video Column Panel"))}</div>',
+            unsafe_allow_html=True,
+        )
+        video_settings.render_video_panel(tr)
+        subtitle_settings.render_subtitle_panel(tr)
+
+    st.markdown(
+        f"""
+        <div class="narrato-action-bar">
+            <div class="narrato-action-title">{escape(tr("Action Bar Title"))}</div>
+            <div class="narrato-action-hint">{escape(tr("Action Bar Hint"))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    action_cols = st.columns([1, 1, 0.4])
+    with action_cols[0]:
+        render_generate_button()
+    with action_cols[1]:
+        render_export_jianying_button()
+
+
 def main():
-    """主函数"""
+    """主函数：中文优先、按工作流分 Tab，降低一屏信息密度。"""
     init_log()
     init_global_state()
 
     # ===== 显式注册 LLM 提供商（最佳实践）=====
-    # 在应用启动时立即注册，确保所有 LLM 功能可用
     if 'llm_providers_registered' not in st.session_state:
         try:
             from app.services.llm.providers import register_all_providers
@@ -668,55 +827,53 @@ def main():
             import traceback
             logger.error(traceback.format_exc())
             st.error(tr("LLM initialization failed").format(error=str(e)))
-            # 不抛出异常，允许应用继续运行（但 LLM 功能不可用）
 
-    # 检测FFmpeg硬件加速，但只打印一次日志（使用 session_state 持久化）
+    # 检测FFmpeg硬件加速，但只打印一次日志
     if 'hwaccel_logged' not in st.session_state:
         st.session_state['hwaccel_logged'] = False
-    
+
     hwaccel_info = ffmpeg_utils.detect_hardware_acceleration()
     if not st.session_state['hwaccel_logged']:
         if hwaccel_info["available"]:
-            logger.info(f"FFmpeg硬件加速检测结果: 可用 | 类型: {hwaccel_info['type']} | 编码器: {hwaccel_info['encoder']} | 独立显卡: {hwaccel_info['is_dedicated_gpu']}")
+            logger.info(
+                f"FFmpeg硬件加速检测结果: 可用 | 类型: {hwaccel_info['type']} | "
+                f"编码器: {hwaccel_info['encoder']} | 独立显卡: {hwaccel_info['is_dedicated_gpu']}"
+            )
         else:
             logger.warning(f"FFmpeg硬件加速不可用: {hwaccel_info['message']}, 将使用CPU软件编码")
         st.session_state['hwaccel_logged'] = True
 
-    # 仅初始化基本资源，避免过早地加载依赖PyTorch的资源
-    # 检查是否能分解utils.init_resources()为基本资源和高级资源(如依赖PyTorch的资源)
     try:
         utils.init_resources()
     except Exception as e:
         logger.warning(f"资源初始化时出现警告: {e}")
 
-    st.title(f"Narrato:blue[AI]:sunglasses: 📽️")
-    st.write(get_help_text())
+    _render_app_header()
 
-    # 首先渲染不依赖PyTorch的UI部分
-    # 渲染基础设置面板
-    basic_settings.render_basic_settings(tr)
+    tab_narration, tab_cross_border, tab_settings = st.tabs(
+        [
+            tr("Workflow Tab Narration"),
+            tr("Workflow Tab Cross Border"),
+            tr("Workflow Tab Settings"),
+        ]
+    )
 
-    # 渲染主面板
-    panel = st.columns(3)
-    with panel[0]:
-        script_settings.render_script_panel(tr)
-    with panel[1]:
-        audio_settings.render_audio_panel(tr)
-    with panel[2]:
-        video_settings.render_video_panel(tr)
-        subtitle_settings.render_subtitle_panel(tr)
+    with tab_narration:
+        _render_narration_workspace()
 
-    # 放到最后渲染可能使用PyTorch的部分
-    # 渲染系统设置面板
-    with panel[2]:
-        system_settings.render_system_panel(tr)
+    with tab_cross_border:
+        st.markdown(
+            f'<div class="narrato-guide">{escape(tr("Workflow Guide Cross Border"))}</div>',
+            unsafe_allow_html=True,
+        )
+        # 独立 Tab，不再沉在页面底部
+        cross_border_panel.render_cross_border_panel(tr)
 
-    # 跨境本地化解说（独立入口，不塞进短剧/影视分支）
-    cross_border_panel.render_cross_border_panel(tr)
-
-    # 放到最后渲染生成按钮和处理逻辑
-    render_generate_button()
-    render_export_jianying_button()
+    with tab_settings:
+        basic_settings.render_basic_settings(tr)
+        # 系统设置也放在设置 Tab，避免与解说工作台重复拥挤
+        with st.expander(tr("System settings"), expanded=False):
+            system_settings.render_system_panel(tr)
 
 
 if __name__ == "__main__":

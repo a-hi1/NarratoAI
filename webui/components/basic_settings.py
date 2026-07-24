@@ -295,30 +295,40 @@ def render_generation_settings(tr):
 
 
 def render_language_settings(tr):
-    st.subheader(tr("Proxy Settings"))
+    """渲染界面语言设置（中文优先）。"""
+    st.subheader(tr("Interface Language"))
 
-    """渲染语言设置"""
-    system_locale = utils.get_system_locale()
     i18n_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "i18n")
     locales = utils.load_locales(i18n_dir)
 
+    # 中文优先：默认 zh；若配置/会话已有合法语言则沿用
+    default_lang = "zh"
+    current = st.session_state.get("ui_language") or config.ui.get("language") or default_lang
+    if current not in locales and "zh" in locales:
+        current = "zh"
+    elif current not in locales:
+        current = next(iter(locales.keys()), "zh")
+
     display_languages = []
     selected_index = 0
-    for i, code in enumerate(locales.keys()):
+    # 保证 zh 排在最前，便于中文用户选择
+    ordered_codes = sorted(locales.keys(), key=lambda c: (0 if c == "zh" else 1, c))
+    for i, code in enumerate(ordered_codes):
         display_languages.append(f"{code} - {locales[code].get('Language')}")
-        if code == st.session_state.get('ui_language', system_locale):
+        if code == current:
             selected_index = i
 
     selected_language = st.selectbox(
         tr("Language"),
         options=display_languages,
-        index=selected_index
+        index=selected_index,
+        help=tr("Interface Language Help"),
     )
 
     if selected_language:
         code = selected_language.split(" - ")[0].strip()
-        st.session_state['ui_language'] = code
-        config.ui['language'] = code
+        st.session_state["ui_language"] = code
+        config.ui["language"] = code
 
 
 def render_proxy_settings(tr):

@@ -48,11 +48,104 @@ def _load_selected_meta() -> Optional[Dict[str, Any]]:
         return None
 
 
+# 流水线步骤（中文展示）
+_PIPELINE_STEPS = [
+    ("asr", "语音识别"),
+    ("translate", "字幕翻译"),
+    ("digest", "内容摘要"),
+    ("copy", "解说文案"),
+    ("match", "脚本匹配"),
+    ("tts", "配音合成"),
+    ("render", "成片渲染"),
+    ("packaging", "标题包装"),
+]
+
+_STATUS_CN = {
+    "draft": "草稿",
+    "queued": "排队中",
+    "asr_running": "识别中",
+    "asr_done": "识别完成",
+    "translate_running": "翻译中",
+    "translate_done": "翻译完成",
+    "digest_running": "摘要中",
+    "digest_done": "摘要完成",
+    "copy_running": "文案生成中",
+    "copy_done": "待审核文案",
+    "match_running": "匹配中",
+    "match_done": "匹配完成",
+    "tts_running": "配音中",
+    "tts_done": "配音完成",
+    "render_running": "渲染中",
+    "render_done": "渲染完成",
+    "packaging_running": "包装中",
+    "packaging_done": "包装完成",
+    "completed": "已完成",
+    "failed": "失败",
+}
+
+_DIRECTION_CN = {
+    "inbound": "引入 Inbound（en→zh）",
+    "outbound": "出海 Outbound（zh→en）",
+}
+
+
+def _step_key_from_status(status: str) -> str:
+    s = (status or "").strip()
+    if s in {"completed", "packaging_done"}:
+        return "packaging"
+    if s == "failed":
+        return ""
+    if s.endswith("_running") or s.endswith("_done"):
+        return s.rsplit("_", 1)[0]
+    if s in {"draft", "queued"}:
+        return ""
+    return s
+
+
+def _render_pipeline_progress(meta: Dict[str, Any]) -> None:
+    """横向步骤条：已完成 / 进行中 / 待办。"""
+    status = meta.get("status") or "draft"
+    current = _step_key_from_status(status)
+    failed_step = ""
+    if status == "failed":
+        failed_step = (meta.get("error") or {}).get("step") or meta.get("step") or ""
+
+    # 已完成到哪一步：_done 状态表示该步完成
+    done_keys = set()
+    order = [k for k, _ in _PIPELINE_STEPS]
+    if status == "completed":
+        done_keys = set(order)
+    elif status.endswith("_done") and current in order:
+        idx = order.index(current)
+        done_keys = set(order[: idx + 1])
+    elif status.endswith("_running") and current in order:
+        idx = order.index(current)
+        done_keys = set(order[:idx])
+    elif failed_step in order:
+        idx = order.index(failed_step)
+        done_keys = set(order[:idx])
+
+    chips = []
+    for key, label in _PIPELINE_STEPS:
+        if key in done_keys:
+            chips.append(f"✅ {label}")
+        elif key == current and status.endswith("_running"):
+            chips.append(f"🔄 **{label}**")
+        elif key == failed_step:
+            chips.append(f"❌ **{label}**")
+        elif status == "copy_done" and key == "copy":
+            chips.append(f"🧭 **{label}（审核）**")
+        else:
+            chips.append(f"⬜ {label}")
+    st.caption(" → ".join(chips))
+
+
 def _status_badge(meta: Dict[str, Any]) -> str:
     status = meta.get("status") or "draft"
     progress = meta.get("progress")
     err = meta.get("error") or {}
-    line = f"**状态:** `{status}`"
+    status_cn = _STATUS_CN.get(status, status)
+    line = f"**状态:** {status_cn} (`{status}`)"
     if progress is not None and progress >= 0:
         line += f" · **进度:** {progress}%"
     if status == "failed" and err:
@@ -60,6 +153,8 @@ def _status_badge(meta: Dict[str, Any]) -> str:
     gate = HUMAN_GATES.get(status)
     if gate:
         line += f"\n\n🧭 {gate}"
+    if status == "copy_done":
+        line += "\n\n✍️ 请审核下方解说文案，确认后点击「继续匹配成片」。"
     if cb_pipeline.is_running(meta.get("task_id") or ""):
         line += "\n\n🔄 后台任务运行中…"
     return line
@@ -69,7 +164,7 @@ def _render_create_form(tr):
     st.subheader(_tr(tr, "Cross-border Localization", "跨境本地化 · 新建任务"))
     st.caption(
         "上传视频 → 选择 引入(In) / 出海(Out) → 后台生成。"
-        " MVP 语对锁定 en↔zh。生成默认在「解说文案」处暂停供你审核。"
+        " 语对锁定 en↔zh。默认在「解说文案」处暂停，审核后再成片。"
     )
 
     direction_label = st.radio(
@@ -77,6 +172,7 @@ def _render_create_form(tr):
         options=["引入 Inbound（en→zh）", "出海 Outbound（zh→en）"],
         horizontal=True,
         key="cb_direction_label",
+        help="引入：外网英文片 → 中文解说；出海：国内中文片 → 英文解说。",
     )
     direction = "inbound" if direction_label.startswith("引入") else "outbound"
 
@@ -273,15 +369,19 @@ def _render_create_form(tr):
 def _render_task_detail(tr, meta: Dict[str, Any]):
     st.subheader(f"任务详情 · {meta.get('task_id')}")
     st.markdown(_status_badge(meta))
+    st.markdown(f"**{_tr(tr, 'Pipeline Progress', '流水线进度')}**")
+    _render_pipeline_progress(meta)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        if st.button("刷新状态", key="cb_refresh"):
+        if st.button("🔄 刷新状态", key="cb_refresh", use_container_width=True):
             st.rerun()
     with c2:
         if st.button(
-            "继续匹配成片",
+            "▶️ 继续匹配成片",
             key="cb_continue",
+            type="primary",
+            use_container_width=True,
             disabled=(meta.get("status") != "copy_done")
             or cb_pipeline.is_running(meta["task_id"]),
         ):
@@ -289,8 +389,9 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
             st.rerun()
     with c3:
         if st.button(
-            "从失败步重试",
+            "♻️ 从失败步重试",
             key="cb_retry",
+            use_container_width=True,
             disabled=meta.get("status") != "failed",
         ):
             step = (meta.get("error") or {}).get("step") or meta.get("step") or "asr"
@@ -299,22 +400,31 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
             cb_pipeline.start_task_background(meta["task_id"], start_step=step, stop_after="copy")
             st.rerun()
     with c4:
-        if st.button("清除当前选择", key="cb_clear"):
+        if st.button("清除当前选择", key="cb_clear", use_container_width=True):
             st.session_state.pop("cb_task_id", None)
             st.rerun()
 
     inputs = meta.get("inputs") or {}
     artifacts = meta.get("artifacts") or {}
-    st.write(
-        {
-            "direction": meta.get("direction"),
-            "langs": f"{meta.get('source_lang')} → {meta.get('target_lang')}",
-            "style_pack": meta.get("style_pack"),
-            "asr_backend": artifacts.get("asr_backend") or inputs.get("asr_backend") or "auto",
-            "video": inputs.get("video_path"),
-            "export_dir": artifacts.get("export_dir"),
-        }
-    )
+    direction = meta.get("direction") or ""
+    info_cols = st.columns(4)
+    with info_cols[0]:
+        st.metric("方向", _DIRECTION_CN.get(direction, direction or "-"))
+    with info_cols[1]:
+        st.metric("语对", f"{meta.get('source_lang') or '-'} → {meta.get('target_lang') or '-'}")
+    with info_cols[2]:
+        st.metric("风格包", meta.get("style_pack") or "-")
+    with info_cols[3]:
+        st.metric(
+            "ASR",
+            artifacts.get("asr_backend") or inputs.get("asr_backend") or "auto",
+        )
+    video_path = inputs.get("video_path") or ""
+    if video_path:
+        st.caption(f"源视频：`{video_path}`")
+    export_dir = artifacts.get("export_dir") or ""
+    if export_dir:
+        st.caption(f"导出目录：`{export_dir}`")
 
     # 字幕预览 + 人工补齐
     with st.expander("字幕预览 / 补齐", expanded=True):
@@ -493,28 +603,56 @@ def _render_task_list(tr):
     st.subheader("任务列表")
     rows = task_store.list_tasks(limit=30)
     if not rows:
-        st.info("暂无跨境任务")
+        st.info("暂无跨境任务。请先在「新建任务」上传视频开始。")
         return
-    st.dataframe(rows, use_container_width=True)
+
+    # 中文列展示
+    display_rows = []
+    for r in rows:
+        status = r.get("status") or ""
+        display_rows.append(
+            {
+                "任务 ID": r.get("task_id"),
+                "方向": _DIRECTION_CN.get(r.get("direction"), r.get("direction")),
+                "状态": _STATUS_CN.get(status, status),
+                "进度": r.get("progress"),
+                "风格包": r.get("style_pack"),
+                "更新时间": r.get("updated_at") or r.get("created_at"),
+            }
+        )
+    st.dataframe(display_rows, use_container_width=True, hide_index=True)
     options = [r["task_id"] for r in rows]
     selected = st.selectbox("打开任务", options=options, key="cb_list_select")
-    if st.button("加载选中任务", key="cb_load_selected"):
+    if st.button("📂 加载选中任务", key="cb_load_selected", type="primary", use_container_width=True):
         st.session_state["cb_task_id"] = selected
         st.rerun()
 
 
 def render_cross_border_panel(tr=None):
-    """供 webui.py 调用的主入口。"""
-    st.divider()
-    st.markdown("### 🌍 跨境本地化解说（MVP）")
+    """供 webui.py 调用的主入口（独立工作流 Tab）。"""
+    st.markdown("### 🌍 跨境本地化解说")
+    st.caption(
+        "把海外视频做成国内平台可播的本地化解说版，也可反向出海。"
+        " 不是纯机翻：风格包 + 术语表 + 原片占比 + 人工审核文案后再成片。"
+    )
 
-    tab_new, tab_detail, tab_list = st.tabs(["新建任务", "任务详情", "任务列表"])
+    # 当前任务快捷条
+    meta = _load_selected_meta()
+    if meta:
+        s = meta.get("status") or "draft"
+        st.info(
+            f"当前任务 `{meta.get('task_id')}` · "
+            f"{_STATUS_CN.get(s, s)} · "
+            f"{_DIRECTION_CN.get(meta.get('direction'), meta.get('direction') or '')}"
+        )
+
+    tab_new, tab_detail, tab_list = st.tabs(["① 新建任务", "② 任务详情", "③ 任务列表"])
     with tab_new:
         _render_create_form(tr)
     with tab_detail:
         meta = _load_selected_meta()
         if not meta:
-            st.info("尚未选择任务。请先在「新建任务」开始，或从「任务列表」加载。")
+            st.info("尚未选择任务。请先在「① 新建任务」开始，或从「③ 任务列表」加载。")
         else:
             _render_task_detail(tr, meta)
     with tab_list:
