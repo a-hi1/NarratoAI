@@ -140,16 +140,46 @@ def _render_pipeline_progress(meta: Dict[str, Any]) -> None:
     st.caption(" → ".join(chips))
 
 
+def _task_label(meta: Dict[str, Any]) -> str:
+    """优先显示人类可读名，技术 ID 放到次要位置。"""
+    name = (meta.get("display_name") or "").strip()
+    if not name:
+        name = task_store.ensure_display_name(meta)
+    return name
+
+
+def _friendly_error(message: Any) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return "未知错误"
+    low = text.lower()
+    if "winerror 5" in low or "拒绝访问" in text or "permissionerror" in low:
+        return (
+            "保存任务状态时文件被占用（常见于 Windows 杀软/索引/并发读写）。"
+            "已自动加重试，请点「从失败步重试」。"
+            f"\n\n技术详情：{text}"
+        )
+    if "placeholder" in low or "占位" in text:
+        return f"{text}\n\n提示：可上传源字幕后点「仅重跑 ASR→翻译」。"
+    return text
+
+
 def _status_badge(meta: Dict[str, Any]) -> str:
     status = meta.get("status") or "draft"
     progress = meta.get("progress")
     err = meta.get("error") or {}
     status_cn = _STATUS_CN.get(status, status)
-    line = f"**状态:** {status_cn} (`{status}`)"
+    step = (err.get("step") if isinstance(err, dict) else None) or meta.get("step") or ""
+    step_cn = dict(_PIPELINE_STEPS).get(step, step)
+
+    line = f"**状态:** {status_cn}"
     if progress is not None and progress >= 0:
         line += f" · **进度:** {progress}%"
+    if status == "failed" and step_cn:
+        line += f" · **失败步骤:** {step_cn}"
     if status == "failed" and err:
-        line += f"\n\n⚠️ {err.get('message') or err}"
+        msg = err.get("message") if isinstance(err, dict) else err
+        line += f"\n\n⚠️ {_friendly_error(msg)}"
     gate = HUMAN_GATES.get(status)
     if gate:
         line += f"\n\n🧭 {gate}"
@@ -229,6 +259,12 @@ def _render_create_form(tr):
         help="每行一条：Source = Target 或 Source|Target|true",
     )
     credit_hint = st.text_input("来源/品牌提示", key="cb_credit_hint", placeholder="频道名或作品名")
+    task_name = st.text_input(
+        "任务显示名称（可选，便于辨认）",
+        key="cb_task_name",
+        help="列表与详情页优先显示此名称。不填则自动生成：方向 · 视频名 · 时间。",
+        placeholder="例如：引入 · 产品开箱 · 抖音本地化",
+    )
     asr_backend = "auto"
     voice_name = "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
     tts_engine = ""
@@ -317,9 +353,7 @@ def _render_create_form(tr):
             st.error("请先上传视频")
             return
 
-        # 落盘视频
-        task_probe = task_store.new_task_id()
-        # create_task 会再生成 id；这里先用 create 后的目录
+        video_title = task_store.video_stem(uploaded.name)
         meta = task_store.create_task(
             direction=direction,
             video_path="",  # 先占位，写入后回填
@@ -337,6 +371,8 @@ def _render_create_form(tr):
             asr_backend=asr_backend,
             voice_name=voice_name,
             tts_engine=tts_engine,
+            task_name=(task_name or "").strip(),
+            video_title=video_title,
         )
         task_id = meta["task_id"]
         tdir = task_store.task_dir(task_id)
@@ -344,6 +380,12 @@ def _render_create_form(tr):
         video_path = os.path.join(tdir, video_name)
         with open(video_path, "wb") as f:
             f.write(uploaded.getbuffer())
+        task_store.refresh_display_name(
+            meta,
+            video_path=video_path,
+            video_title=video_title,
+            task_name=(task_name or "").strip(),
+        )
         meta["inputs"]["video_path"] = video_path
 
         if uploaded_srt is not None:
@@ -359,15 +401,18 @@ def _render_create_form(tr):
         ok = cb_pipeline.start_task_background(
             task_id, start_step="asr", stop_after=stop_after
         )
+        label = meta.get("display_name") or task_id
         if ok:
-            st.success(f"任务已创建并后台启动：{task_id}")
+            st.success(f"任务已创建并后台启动：{label}")
         else:
-            st.warning(f"任务已创建，但后台线程未能启动（可能已在跑）：{task_id}")
+            st.warning(f"任务已创建，但后台线程未能启动（可能已在跑）：{label}")
         st.rerun()
 
 
 def _render_task_detail(tr, meta: Dict[str, Any]):
-    st.subheader(f"任务详情 · {meta.get('task_id')}")
+    label = _task_label(meta)
+    st.subheader(f"任务详情 · {label}")
+    st.caption(f"内部编号：`{meta.get('task_id')}`")
     st.markdown(_status_badge(meta))
     st.markdown(f"**{_tr(tr, 'Pipeline Progress', '流水线进度')}**")
     _render_pipeline_progress(meta)
@@ -402,6 +447,19 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
     with c4:
         if st.button("清除当前选择", key="cb_clear", use_container_width=True):
             st.session_state.pop("cb_task_id", None)
+            st.rerun()
+
+    # 允许改显示名
+    with st.expander("重命名任务", expanded=False):
+        new_name = st.text_input(
+            "显示名称",
+            value=label,
+            key=f"cb_rename_{meta.get('task_id')}",
+        )
+        if st.button("保存名称", key="cb_save_name"):
+            task_store.refresh_display_name(meta, task_name=(new_name or "").strip())
+            task_store.save_meta(meta)
+            st.success("已更新显示名称")
             st.rerun()
 
     inputs = meta.get("inputs") or {}
@@ -606,23 +664,29 @@ def _render_task_list(tr):
         st.info("暂无跨境任务。请先在「新建任务」上传视频开始。")
         return
 
-    # 中文列展示
+    # 中文列展示：优先可读名
     display_rows = []
+    option_labels = []
+    option_ids = []
     for r in rows:
         status = r.get("status") or ""
+        name = r.get("display_name") or r.get("task_id")
         display_rows.append(
             {
-                "任务 ID": r.get("task_id"),
+                "任务名称": name,
+                "视频": r.get("video_title") or "-",
                 "方向": _DIRECTION_CN.get(r.get("direction"), r.get("direction")),
                 "状态": _STATUS_CN.get(status, status),
-                "进度": r.get("progress"),
+                "进度": f"{r.get('progress') or 0}%",
                 "风格包": r.get("style_pack"),
                 "更新时间": r.get("updated_at") or r.get("created_at"),
             }
         )
+        option_ids.append(r["task_id"])
+        option_labels.append(f"{name}  ·  {_STATUS_CN.get(status, status)}")
     st.dataframe(display_rows, use_container_width=True, hide_index=True)
-    options = [r["task_id"] for r in rows]
-    selected = st.selectbox("打开任务", options=options, key="cb_list_select")
+    selected_label = st.selectbox("打开任务", options=option_labels, key="cb_list_select")
+    selected = option_ids[option_labels.index(selected_label)] if selected_label in option_labels else option_ids[0]
     if st.button("📂 加载选中任务", key="cb_load_selected", type="primary", use_container_width=True):
         st.session_state["cb_task_id"] = selected
         st.rerun()
@@ -641,7 +705,7 @@ def render_cross_border_panel(tr=None):
     if meta:
         s = meta.get("status") or "draft"
         st.info(
-            f"当前任务 `{meta.get('task_id')}` · "
+            f"当前任务 **{_task_label(meta)}** · "
             f"{_STATUS_CN.get(s, s)} · "
             f"{_DIRECTION_CN.get(meta.get('direction'), meta.get('direction') or '')}"
         )

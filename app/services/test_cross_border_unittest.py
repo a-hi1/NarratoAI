@@ -109,18 +109,74 @@ class TaskStoreTests(unittest.TestCase):
                     video_path=os.path.join(tmp, "demo.mp4"),
                     glossary="MrBeast = MrBeast",
                     asr_backend="local",
+                    video_title="开箱评测",
+                    task_name="",
                 )
                 self.assertTrue(meta["task_id"].startswith("cb_"))
                 self.assertEqual(meta["status"], "draft")
                 self.assertEqual(meta["source_lang"], "en")
                 self.assertEqual(meta["target_lang"], "zh")
                 self.assertEqual(meta["inputs"]["asr_backend"], "local")
+                self.assertIn("display_name", meta)
+                self.assertIn("引入", meta["display_name"])
+                self.assertIn("开箱评测", meta["display_name"])
                 meta = task_store.transition(meta, "queued")
                 self.assertEqual(meta["status"], "queued")
                 path = task_store.write_text_artifact(meta["task_id"], "digest.md", "# ok\n")
                 self.assertTrue(os.path.isfile(path))
                 rows = task_store.list_tasks()
                 self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["display_name"], meta["display_name"])
+
+    def test_display_name_custom_and_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="outbound",
+                    video_path="",
+                    task_name="我的出海片 A",
+                )
+                self.assertEqual(meta["display_name"], "我的出海片 A")
+                task_store.refresh_display_name(
+                    meta,
+                    video_path=os.path.join(tmp, "产品演示.mp4"),
+                    video_title="产品演示",
+                    task_name="",
+                )
+                # 自定义名仍在 inputs.task_name 时优先；清空后走自动
+                meta["inputs"]["task_name"] = ""
+                task_store.refresh_display_name(
+                    meta,
+                    video_path=os.path.join(tmp, "产品演示.mp4"),
+                    video_title="产品演示",
+                )
+                self.assertIn("出海", meta["display_name"])
+                self.assertIn("产品演示", meta["display_name"])
+                task_store.save_meta(meta)
+                loaded = task_store.load_meta(meta["task_id"])
+                self.assertEqual(loaded["display_name"], meta["display_name"])
+
+    def test_save_meta_retry_on_permission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=os.path.join(tmp, "a.mp4"),
+                    video_title="锁文件测试",
+                )
+                calls = {"n": 0}
+                real_replace = os.replace
+
+                def flaky_replace(src, dst):
+                    calls["n"] += 1
+                    if calls["n"] < 3:
+                        raise PermissionError(5, "拒绝访问")
+                    return real_replace(src, dst)
+
+                with mock.patch.object(os, "replace", side_effect=flaky_replace):
+                    meta = task_store.transition(meta, "queued")
+                self.assertEqual(meta["status"], "queued")
+                self.assertGreaterEqual(calls["n"], 3)
 
 
 class PackagingTests(unittest.TestCase):

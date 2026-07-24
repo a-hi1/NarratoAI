@@ -25,6 +25,7 @@ from .glossary import normalize_glossary
 
 
 META_NAME = "meta.json"
+_DIR_LABEL = {"inbound": "引入", "outbound": "出海"}
 
 
 def tasks_root() -> str:
@@ -40,6 +41,66 @@ def _now_iso() -> str:
 def new_task_id() -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"cb_{stamp}_{uuid.uuid4().hex[:6]}"
+
+
+def video_stem(video_path: str) -> str:
+    """从路径提取可读视频名（无扩展名）。"""
+    base = os.path.basename(video_path or "") or ""
+    stem = os.path.splitext(base)[0].strip()
+    if not stem:
+        return "未命名视频"
+    stem = re.sub(r"\s+", " ", stem)
+    if len(stem) > 24:
+        stem = stem[:22] + "…"
+    return stem
+
+
+def build_display_name(
+    *,
+    direction: str,
+    video_path: str = "",
+    video_title: str = "",
+    created_at: str = "",
+    custom_name: str = "",
+) -> str:
+    """
+    生成人类可读任务名，例如：
+      引入 · 测试视频 · 07-24 17:16
+    """
+    custom = (custom_name or "").strip()
+    if custom:
+        return custom[:48]
+
+    dir_cn = _DIR_LABEL.get((direction or "").lower(), direction or "任务")
+    title = (video_title or "").strip() or video_stem(video_path)
+    stamp = ""
+    if created_at:
+        try:
+            raw = created_at.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            stamp = dt.strftime("%m-%d %H:%M")
+        except Exception:
+            stamp = ""
+    if not stamp:
+        stamp = datetime.now().strftime("%m-%d %H:%M")
+    return f"{dir_cn} · {title} · {stamp}"
+
+
+def ensure_display_name(meta: Dict[str, Any]) -> str:
+    """保证 meta 有 display_name；旧任务自动补全。"""
+    name = (meta.get("display_name") or "").strip()
+    if name:
+        return name
+    inputs = meta.get("inputs") or {}
+    name = build_display_name(
+        direction=meta.get("direction") or "",
+        video_path=inputs.get("video_path") or "",
+        video_title=inputs.get("video_title") or "",
+        created_at=meta.get("created_at") or "",
+        custom_name=inputs.get("task_name") or "",
+    )
+    meta["display_name"] = name
+    return name
 
 
 def task_dir(task_id: str) -> str:
@@ -61,18 +122,74 @@ def load_meta(task_id: str) -> Dict[str, Any]:
     path = meta_path(task_id)
     if not os.path.exists(path):
         raise FileNotFoundError(f"task meta not found: {task_id}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    last_err: Optional[Exception] = None
+    # Windows 上后台写 / 前台读可能短暂锁文件
+    for attempt in range(6):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            ensure_display_name(meta)
+            return meta
+        except (PermissionError, OSError, json.JSONDecodeError) as exc:
+            last_err = exc
+            time.sleep(0.04 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    """
+    尽量原子写 JSON。Windows 上 os.replace 常因杀软/并发读报 WinError 5，
+    故加重试 + 直接覆盖兜底。
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+    last_err: Optional[Exception] = None
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            last_err = exc
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            last_err = exc
+            time.sleep(0.05 * (attempt + 1))
+
+    # 兜底：直接写目标文件（非原子，但避免整条流水线因锁失败）
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        logger.warning(f"meta atomic replace failed, wrote directly: {path} ({last_err})")
+    finally:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def save_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     task_id = meta["task_id"]
     meta["updated_at"] = _now_iso()
+    ensure_display_name(meta)
     path = meta_path(task_id)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    _atomic_write_json(path, meta)
     return meta
 
 
@@ -96,6 +213,8 @@ def create_task(
     tts_engine: str = "",
     voice_rate: float = 1.0,
     voice_pitch: float = 1.0,
+    task_name: str = "",
+    video_title: str = "",
 ) -> Dict[str, Any]:
     direction = (direction or "inbound").lower()
     if direction not in {"inbound", "outbound"}:
@@ -132,8 +251,18 @@ def create_task(
 
     task_id = new_task_id()
     task_dir(task_id)
+    created = _now_iso()
+    title = (video_title or "").strip() or video_stem(video_path)
+    display_name = build_display_name(
+        direction=direction,
+        video_path=video_path,
+        video_title=title,
+        created_at=created,
+        custom_name=task_name,
+    )
     meta: Dict[str, Any] = {
         "task_id": task_id,
+        "display_name": display_name,
         "direction": direction,
         "source_lang": source_lang,
         "target_lang": target_lang,
@@ -143,6 +272,8 @@ def create_task(
         "progress": 0,
         "inputs": {
             "video_path": video_path,
+            "video_title": title,
+            "task_name": (task_name or "").strip(),
             "glossary": normalize_glossary(glossary),
             "duration_mode": duration_mode,
             "original_audio_ratio": float(original_audio_ratio),
@@ -174,10 +305,37 @@ def create_task(
         },
         "error": None,
         "logs": [],
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
+        "created_at": created,
+        "updated_at": created,
     }
     return save_meta(meta)
+
+
+def refresh_display_name(
+    meta: Dict[str, Any],
+    *,
+    video_path: str = "",
+    video_title: str = "",
+    task_name: str = "",
+) -> Dict[str, Any]:
+    """视频落盘或用户改名后刷新可读名称。"""
+    inputs = meta.setdefault("inputs", {})
+    if video_path:
+        inputs["video_path"] = video_path
+        if not video_title:
+            video_title = video_stem(video_path)
+    if video_title:
+        inputs["video_title"] = video_title
+    if task_name is not None and str(task_name).strip() != "":
+        inputs["task_name"] = str(task_name).strip()
+    meta["display_name"] = build_display_name(
+        direction=meta.get("direction") or "",
+        video_path=inputs.get("video_path") or "",
+        video_title=inputs.get("video_title") or "",
+        created_at=meta.get("created_at") or "",
+        custom_name=inputs.get("task_name") or "",
+    )
+    return meta
 
 
 def append_log(meta: Dict[str, Any], message: str, level: str = "INFO") -> Dict[str, Any]:
@@ -238,9 +396,14 @@ def list_tasks(limit: int = 50) -> List[Dict[str, Any]]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
+            ensure_display_name(meta)
+            inputs = meta.get("inputs") or {}
             rows.append(
                 {
                     "task_id": meta.get("task_id") or name,
+                    "display_name": meta.get("display_name") or name,
+                    "video_title": inputs.get("video_title")
+                    or video_stem(inputs.get("video_path") or ""),
                     "direction": meta.get("direction"),
                     "status": meta.get("status"),
                     "progress": meta.get("progress"),
