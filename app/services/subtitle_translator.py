@@ -61,8 +61,18 @@ def _split_blocks(blocks, batch_size: int):
     return [blocks[index:index + batch_size] for index in range(0, len(blocks), batch_size)]
 
 
-def _build_translation_prompt(blocks, target_language: str) -> str:
+def _build_translation_prompt(
+    blocks,
+    target_language: str,
+    glossary_block: str = "",
+) -> str:
     payload = {str(block.order): block.text for block in blocks}
+    glossary_section = ""
+    if glossary_block and glossary_block.strip():
+        glossary_section = f"""
+术语表（必须遵守，lock=true 的目标写法不可改写）：
+{glossary_block.strip()}
+"""
     return f"""
 请将以下 SRT 字幕文本翻译为{target_language}。
 
@@ -72,7 +82,8 @@ def _build_translation_prompt(blocks, target_language: str) -> str:
 3. 保留必要的说话人标记、专有名词、品牌名、代码、数字和换行；除非目标语言中有约定译名。
 4. 不要添加解释、注释、剧情信息或 Markdown。
 5. 空字幕文本保持为空字符串。
-
+6. 若提供术语表，对 lock=true 的词条必须使用表中 Target 写法，不得自由音译。
+{glossary_section}
 只输出严格 JSON 对象，不要输出 Markdown 或解释文字。必须保留所有输入 key，格式必须为：
 {{"1":"翻译后的字幕文本","2":"翻译后的字幕文本"}}
 
@@ -123,13 +134,17 @@ def _build_repair_prompt(
     target_language: str,
     previous_output: str,
     error_message: str,
+    glossary_block: str = "",
 ) -> str:
     payload = {str(block.order): block.text for block in blocks}
+    glossary_section = ""
+    if glossary_block and glossary_block.strip():
+        glossary_section = f"\n术语表：\n{glossary_block.strip()}\n"
     return f"""
 你上一轮返回的字幕翻译 JSON 无法通过校验，请修复后重新输出。
 
 目标语言：{target_language}
-
+{glossary_section}
 校验错误：
 {error_message}
 
@@ -155,6 +170,7 @@ def _translate_chunk(
     model_name: str,
     temperature: float,
     max_repair_attempts: int,
+    glossary_block: str = "",
 ) -> dict[int, str]:
     start_order = chunk[0].order
     end_order = chunk[-1].order
@@ -164,7 +180,7 @@ def _translate_chunk(
         f"条目 {start_order}-{end_order}, 共 {len(chunk)} 条"
     )
 
-    prompt = _build_translation_prompt(chunk, target_language)
+    prompt = _build_translation_prompt(chunk, target_language, glossary_block=glossary_block)
     last_output = ""
     last_error = ""
     for attempt in range(1, max_repair_attempts + 1):
@@ -177,6 +193,7 @@ def _translate_chunk(
                 target_language=target_language,
                 previous_output=last_output,
                 error_message=last_error,
+                glossary_block=glossary_block,
             )
 
         raw_output = _run_async_safely(
@@ -252,6 +269,7 @@ def translate_srt_content(
     batch_size: int | None = None,
     max_workers: int | None = None,
     progress_callback: TranslationProgressCallback | None = None,
+    glossary_block: str = "",
 ) -> str:
     target_language = str(target_language or "").strip() or "中文"
     blocks = parse_srt_blocks(srt_content)
@@ -294,6 +312,7 @@ def translate_srt_content(
                 model_name=resolved_model_name,
                 temperature=temperature,
                 max_repair_attempts=DEFAULT_MAX_REPAIR_ATTEMPTS,
+                glossary_block=glossary_block,
             )
         )
         completed_blocks = total_blocks
@@ -314,6 +333,7 @@ def translate_srt_content(
                     model_name=resolved_model_name,
                     temperature=temperature,
                     max_repair_attempts=DEFAULT_MAX_REPAIR_ATTEMPTS,
+                    glossary_block=glossary_block,
                 )
                 future_to_meta[future] = (index, chunk)
 
@@ -363,6 +383,7 @@ def translate_subtitle_file(
     batch_size: int | None = None,
     max_workers: int | None = None,
     progress_callback: TranslationProgressCallback | None = None,
+    glossary_block: str = "",
 ) -> str:
     if not subtitle_file or not os.path.isfile(subtitle_file):
         raise SubtitleTranslationError(f"字幕文件不存在: {subtitle_file}")
@@ -379,5 +400,6 @@ def translate_subtitle_file(
         batch_size=batch_size,
         max_workers=max_workers,
         progress_callback=progress_callback,
+        glossary_block=glossary_block,
     )
     return write_srt_file(translated_srt, output_file)

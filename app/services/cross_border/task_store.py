@@ -92,6 +92,10 @@ def create_task(
     credit_hint: str = "",
     narration_word_count: Optional[int] = None,
     voice_name: str = "",
+    asr_backend: str = "auto",
+    tts_engine: str = "",
+    voice_rate: float = 1.0,
+    voice_pitch: float = 1.0,
 ) -> Dict[str, Any]:
     direction = (direction or "inbound").lower()
     if direction not in {"inbound", "outbound"}:
@@ -149,10 +153,15 @@ def create_task(
             "narration_word_count": int(narration_word_count),
             "voice_name": voice_name,
             "style_addendum": pack.get("prompt_addendum") or "",
+            "asr_backend": (asr_backend or "auto").strip().lower() or "auto",
+            "tts_engine": (tts_engine or "").strip(),
+            "voice_rate": float(voice_rate or 1.0),
+            "voice_pitch": float(voice_pitch or 1.0),
         },
         "artifacts": {
             "source_srt": "",
             "target_srt": "",
+            "asr_backend": "",
             "digest": "",
             "narration_copy": "",
             "script_json": "",

@@ -5,6 +5,7 @@
 跨境本地化解说服务（en↔zh 双向 MVP 骨架）
 """
 
+from . import asr
 from . import compliance
 from . import glossary
 from . import packaging
@@ -14,6 +15,7 @@ from . import style_packs
 from . import task_store
 
 __all__ = [
+    "asr",
     "compliance",
     "glossary",
     "packaging",

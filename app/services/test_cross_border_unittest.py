@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from app.services.cross_border import asr as asr_mod
 from app.services.cross_border import compliance, glossary, packaging, state_machine, style_packs, task_store
 from app.services.prompts import PromptManager
 
@@ -107,11 +108,13 @@ class TaskStoreTests(unittest.TestCase):
                     direction="inbound",
                     video_path=os.path.join(tmp, "demo.mp4"),
                     glossary="MrBeast = MrBeast",
+                    asr_backend="local",
                 )
                 self.assertTrue(meta["task_id"].startswith("cb_"))
                 self.assertEqual(meta["status"], "draft")
                 self.assertEqual(meta["source_lang"], "en")
                 self.assertEqual(meta["target_lang"], "zh")
+                self.assertEqual(meta["inputs"]["asr_backend"], "local")
                 meta = task_store.transition(meta, "queued")
                 self.assertEqual(meta["status"], "queued")
                 path = task_store.write_text_artifact(meta["task_id"], "digest.md", "# ok\n")
@@ -176,6 +179,87 @@ class PromptRegistrationTests(unittest.TestCase):
         )
         self.assertIn("Core Claims", rendered)
         self.assertIn("Hello", rendered)
+
+
+class AsrRoutingTests(unittest.TestCase):
+    def test_backend_chain_language_bias(self):
+        zh_chain = asr_mod.backend_chain("auto", "zh")
+        en_chain = asr_mod.backend_chain("auto", "en")
+        self.assertEqual(zh_chain[0], "local")
+        self.assertEqual(en_chain[0], "firered")
+        self.assertEqual(asr_mod.backend_chain("bailian", "en")[0], "bailian")
+        self.assertEqual(asr_mod.backend_chain("manual", "en"), [])
+
+    def test_run_asr_success_and_placeholder(self):
+        sample = "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+
+        def fake_local(video, srt, lang):
+            with open(srt, "w", encoding="utf-8") as f:
+                f.write(sample)
+            return srt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            video = os.path.join(tmp, "a.mp4")
+            with open(video, "wb") as f:
+                f.write(b"\x00")
+            out = os.path.join(tmp, "source.srt")
+            with mock.patch.dict(
+                asr_mod._BACKEND_RUNNERS,
+                {
+                    "local": fake_local,
+                    "firered": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")),
+                    "bailian": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")),
+                    "whisper": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")),
+                },
+            ):
+                path, backend, logs = asr_mod.run_asr(
+                    video_path=video,
+                    subtitle_file=out,
+                    source_lang="zh",
+                    preferred_backend="local",
+                )
+            self.assertEqual(backend, "local")
+            self.assertTrue(os.path.isfile(path))
+            self.assertFalse(asr_mod.is_placeholder_srt(path))
+            self.assertTrue(any("success" in x for x in logs))
+
+            # all fail -> placeholder
+            out2 = os.path.join(tmp, "source2.srt")
+            with mock.patch.dict(
+                asr_mod._BACKEND_RUNNERS,
+                {
+                    "local": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+                    "firered": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+                    "bailian": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+                    "whisper": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+                },
+            ):
+                path2, backend2, logs2 = asr_mod.run_asr(
+                    video_path=video,
+                    subtitle_file=out2,
+                    source_lang="en",
+                    preferred_backend="auto",
+                )
+            self.assertEqual(backend2, "placeholder")
+            self.assertTrue(asr_mod.is_placeholder_srt(path2))
+            self.assertTrue(any("failed" in x.lower() for x in logs2))
+
+
+class TranslateGlossaryPromptTests(unittest.TestCase):
+    def test_prompt_contains_glossary(self):
+        from app.services.subtitle_corrector import parse_srt_blocks
+        from app.services.subtitle_translator import _build_translation_prompt
+
+        blocks = parse_srt_blocks(
+            "1\n00:00:00,000 --> 00:00:01,000\nTry Lao Gan Ma\n"
+        )
+        prompt = _build_translation_prompt(
+            blocks,
+            "English",
+            glossary_block="| 老干妈 | Lao Gan Ma | true |",
+        )
+        self.assertIn("Lao Gan Ma", prompt)
+        self.assertIn("术语表", prompt)
 
 
 class PipelineSkeletonTests(unittest.TestCase):
@@ -248,6 +332,7 @@ class PipelineSkeletonTests(unittest.TestCase):
                     direction="inbound",
                     video_path=video_path,
                     style_pack="in_hook_narration",
+                    glossary="Hello = 哈喽",
                 )
                 srt_path = task_store.artifact_path(meta["task_id"], "source.srt")
                 with open(srt_path, "w", encoding="utf-8") as f:
@@ -283,10 +368,150 @@ class PipelineSkeletonTests(unittest.TestCase):
                     os.path.isdir(task_store.artifact_path(meta["task_id"], "export"))
                 )
 
+    def test_step_asr_uses_router(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        sample = "1\n00:00:00,000 --> 00:00:01,000\nHello router\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            video = os.path.join(tmp, "v.mp4")
+            with open(video, "wb") as f:
+                f.write(b"00")
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=video,
+                    asr_backend="local",
+                )
+                meta = task_store.transition(meta, "queued")
+
+                def fake_run_asr(**kwargs):
+                    path = kwargs["subtitle_file"]
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(sample)
+                    return path, "local", ["trying ASR backend=local", "ASR success via local"]
+
+                with mock.patch.object(asr_mod, "run_asr", side_effect=fake_run_asr):
+                    result = cb_pipeline.step_asr(meta)
+
+                self.assertEqual(result["status"], "asr_done")
+                self.assertEqual(result["artifacts"]["asr_backend"], "local")
+                self.assertIn(
+                    "Hello router",
+                    task_store.read_text_artifact(result["artifacts"]["source_srt"]),
+                )
+
+    def test_step_translate_rejects_placeholder(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=os.path.join(tmp, "x.mp4"),
+                )
+                asr_mod.write_placeholder_srt(
+                    task_store.artifact_path(meta["task_id"], "source.srt")
+                )
+                meta["artifacts"]["source_srt"] = task_store.artifact_path(
+                    meta["task_id"], "source.srt"
+                )
+                meta = task_store.transition(meta, "queued")
+                meta = task_store.transition(meta, "asr_running")
+                meta = task_store.transition(meta, "asr_done")
+                result = cb_pipeline.step_translate(meta)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("placeholder", (result.get("error") or {}).get("message", "").lower())
+
+    def test_step_tts_uses_voice_service(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        items = [
+            {
+                "_id": 1,
+                "timestamp": "00:00:00,000-00:00:03,000",
+                "narration": "这是解说",
+                "OST": 0,
+            },
+            {
+                "_id": 2,
+                "timestamp": "00:00:03,000-00:00:06,000",
+                "narration": "播放原片2",
+                "OST": 1,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=os.path.join(tmp, "v.mp4"),
+                    voice_name="zh-CN-XiaoyiNeural",
+                    tts_engine="edge_tts",
+                )
+                task_store.write_json_artifact(
+                    meta["task_id"], "script.json", {"items": items}
+                )
+                meta["artifacts"]["script_json"] = task_store.artifact_path(
+                    meta["task_id"], "script.json"
+                )
+                # advance to match_done
+                for st in (
+                    "queued",
+                    "asr_running",
+                    "asr_done",
+                    "translate_running",
+                    "translate_done",
+                    "digest_running",
+                    "digest_done",
+                    "copy_running",
+                    "copy_done",
+                    "match_running",
+                    "match_done",
+                ):
+                    meta = task_store.transition(meta, st)
+
+                def fake_voice_tts(**kwargs):
+                    path = kwargs["voice_file"]
+                    with open(path, "wb") as f:
+                        f.write(b"ID3fake")
+                    return object()
+
+                with mock.patch(
+                    "app.services.voice.tts", side_effect=fake_voice_tts
+                ):
+                    result = cb_pipeline.step_tts(meta)
+
+                self.assertEqual(result["status"], "tts_done")
+                clips = [
+                    n
+                    for n in os.listdir(result["artifacts"]["tts_dir"])
+                    if n.endswith(".mp3")
+                ]
+                self.assertEqual(len(clips), 1)
+                self.assertTrue(
+                    os.path.isfile(
+                        task_store.artifact_path(meta["task_id"], "tts_manifest.json")
+                    )
+                )
+
+    def test_normalize_script_items_ost(self):
+        from app.services.cross_border.pipeline import _normalize_script_items
+
+        items = _normalize_script_items(
+            [
+                {"narration": "播放原片x", "OST": 0},
+                {"narration": "", "OST": 1},
+                {"narration": "正常解说", "OST": 0},
+            ],
+            "demo.mp4",
+        )
+        self.assertEqual(items[0]["OST"], 1)
+        self.assertTrue(items[1]["narration"].startswith("播放原片"))
+        self.assertEqual(items[2]["OST"], 0)
+        self.assertEqual(items[2]["narration"], "正常解说")
+
 
 def _fake_translate(meta, sample_srt):
     from app.services.cross_border.task_store import (
-        artifact_path,
         save_meta,
         transition,
         write_text_artifact,
@@ -300,21 +525,10 @@ def _fake_translate(meta, sample_srt):
 
 
 def _fake_pass(meta, step):
-    from app.services.cross_border.task_store import save_meta, transition
+    from app.services.cross_border.task_store import artifact_path, save_meta, transition
 
     meta = transition(meta, f"{step}_running")
     if step == "tts":
-        tts_dir = os.path.join(
-            os.path.dirname(
-                __import__("app.services.cross_border.task_store", fromlist=["artifact_path"]).artifact_path(
-                    meta["task_id"], "x"
-                )
-            ),
-            "tts",
-        )
-        # simpler:
-        from app.services.cross_border.task_store import artifact_path
-
         tts_dir = artifact_path(meta["task_id"], "tts")
         os.makedirs(tts_dir, exist_ok=True)
         meta["artifacts"]["tts_dir"] = tts_dir

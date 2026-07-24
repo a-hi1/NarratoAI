@@ -133,6 +133,9 @@ def _render_create_form(tr):
         help="每行一条：Source = Target 或 Source|Target|true",
     )
     credit_hint = st.text_input("来源/品牌提示", key="cb_credit_hint", placeholder="频道名或作品名")
+    asr_backend = "auto"
+    voice_name = "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
+    tts_engine = ""
 
     with st.expander("高级", expanded=False):
         if direction == "inbound":
@@ -144,6 +147,29 @@ def _render_create_form(tr):
             source_lang = st.text_input("源语言", value=source_lang, key="cb_source_lang")
         with c2:
             target_lang = st.text_input("目标语言", value=target_lang, key="cb_target_lang")
+        asr_backend_label = st.selectbox(
+            "ASR 后端",
+            options=[
+                "auto（按语言 + 配置自动）",
+                "local FunASR-Pack",
+                "firered 本地 ASR",
+                "bailian 阿里百炼",
+                "whisper 本地",
+                "manual 仅用上传字幕",
+            ],
+            index=0,
+            key="cb_asr_backend",
+            help="优先用项目 fun_asr 配置；全部失败则写占位字幕，可人工补齐后重试。",
+        )
+        asr_backend_map = {
+            "auto（按语言 + 配置自动）": "auto",
+            "local FunASR-Pack": "local",
+            "firered 本地 ASR": "firered",
+            "bailian 阿里百炼": "bailian",
+            "whisper 本地": "whisper",
+            "manual 仅用上传字幕": "manual",
+        }
+        asr_backend = asr_backend_map.get(asr_backend_label, "auto")
         content_type = st.selectbox(
             "内容类型",
             options=[
@@ -174,6 +200,21 @@ def _render_create_form(tr):
             value=True,
             key="cb_stop_at_copy",
         )
+        default_voice = (
+            "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
+        )
+        voice_name = st.text_input(
+            "TTS 音色",
+            value=default_voice,
+            key="cb_voice_name",
+            help="默认 Edge 神经音色；也可填项目配置的其他引擎音色名。",
+        )
+        tts_engine = st.selectbox(
+            "TTS 引擎",
+            options=["", "edge_tts", "azure_speech", "doubaotts", "tencent_tts", "qwen3_tts"],
+            format_func=lambda x: x or "跟随全局配置",
+            key="cb_tts_engine",
+        )
 
     if st.button("开始生成", type="primary", use_container_width=True, key="cb_start"):
         if not uploaded:
@@ -197,6 +238,9 @@ def _render_create_form(tr):
             platform=platform,
             credit_hint=credit_hint,
             narration_word_count=int(narration_word_count),
+            asr_backend=asr_backend,
+            voice_name=voice_name,
+            tts_engine=tts_engine,
         )
         task_id = meta["task_id"]
         tdir = task_store.task_dir(task_id)
@@ -266,22 +310,94 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
             "direction": meta.get("direction"),
             "langs": f"{meta.get('source_lang')} → {meta.get('target_lang')}",
             "style_pack": meta.get("style_pack"),
+            "asr_backend": artifacts.get("asr_backend") or inputs.get("asr_backend") or "auto",
             "video": inputs.get("video_path"),
             "export_dir": artifacts.get("export_dir"),
         }
     )
 
-    # 字幕预览
-    with st.expander("字幕预览", expanded=False):
+    # 字幕预览 + 人工补齐
+    with st.expander("字幕预览 / 补齐", expanded=True):
         src = artifacts.get("source_srt") or ""
         tgt = artifacts.get("target_srt") or ""
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("**源字幕**")
+            st.markdown("**源字幕 (source.srt)**")
             st.text(task_store.read_text_artifact(src)[:4000] or "(空)")
+            upload_src = st.file_uploader(
+                "替换源字幕",
+                type=["srt"],
+                key=f"cb_replace_src_{meta['task_id']}",
+            )
+            if upload_src is not None and st.button("保存源字幕", key="cb_save_src_srt"):
+                path = task_store.write_text_artifact(
+                    meta["task_id"],
+                    "source.srt",
+                    upload_src.getvalue().decode("utf-8", errors="ignore"),
+                )
+                meta["artifacts"]["source_srt"] = path
+                meta["artifacts"]["asr_backend"] = "uploaded"
+                # 源字幕变更后清掉旧目标字幕，避免错配
+                old_tgt = meta["artifacts"].get("target_srt") or ""
+                if old_tgt and os.path.isfile(old_tgt):
+                    try:
+                        os.remove(old_tgt)
+                    except OSError:
+                        pass
+                meta["artifacts"]["target_srt"] = ""
+                task_store.append_log(meta, "source.srt replaced by user")
+                task_store.save_meta(meta)
+                st.success("源字幕已更新，可点「从失败步重试」或重新启动 asr/translate")
+                st.rerun()
         with col_b:
-            st.markdown("**目标字幕**")
+            st.markdown("**目标字幕 (target.srt)**")
             st.text(task_store.read_text_artifact(tgt)[:4000] or "(空)")
+            upload_tgt = st.file_uploader(
+                "替换目标字幕",
+                type=["srt"],
+                key=f"cb_replace_tgt_{meta['task_id']}",
+            )
+            if upload_tgt is not None and st.button("保存目标字幕", key="cb_save_tgt_srt"):
+                path = task_store.write_text_artifact(
+                    meta["task_id"],
+                    "target.srt",
+                    upload_tgt.getvalue().decode("utf-8", errors="ignore"),
+                )
+                meta["artifacts"]["target_srt"] = path
+                task_store.append_log(meta, "target.srt replaced by user")
+                task_store.save_meta(meta)
+                st.success("目标字幕已更新")
+                st.rerun()
+
+        if st.button(
+            "仅重跑 ASR→翻译",
+            key="cb_rerun_subtitle",
+            disabled=cb_pipeline.is_running(meta.get("task_id") or ""),
+        ):
+            # 清掉可能的占位/旧目标，强制重走字幕层
+            for name in ("source.srt", "target.srt"):
+                p = task_store.artifact_path(meta["task_id"], name)
+                if os.path.isfile(p) and name == "target.srt":
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            # 若源是占位则删掉以触发重新 ASR
+            from app.services.cross_border import asr as asr_mod
+
+            src_path = task_store.artifact_path(meta["task_id"], "source.srt")
+            if asr_mod.is_placeholder_srt(src_path):
+                try:
+                    os.remove(src_path)
+                except OSError:
+                    pass
+                meta["artifacts"]["source_srt"] = ""
+            meta["artifacts"]["target_srt"] = ""
+            task_store.save_meta(meta)
+            cb_pipeline.start_task_background(
+                meta["task_id"], start_step="asr", stop_after="copy"
+            )
+            st.rerun()
 
     # 摘要
     digest_path = artifacts.get("digest") or ""

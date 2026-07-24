@@ -8,6 +8,10 @@ W1 目标：
 - 任务目录 + 状态机可跑通
 - LLM 步骤（digest/copy/match/package）可在已有 LLM 配置下执行
 - ASR/translate/TTS/render 可插拔；缺依赖时写入占位产物并允许人工补齐后继续
+
+W2 目标：
+- ASR 路由对接项目 FunASR（local/firered/bailian）+ whisper 回退
+- translate 注入 glossary；锁定术语后处理
 """
 
 from __future__ import annotations
@@ -25,8 +29,13 @@ from loguru import logger
 from app.services.prompts import PromptManager
 from app.services.subtitle_text import read_subtitle_text
 
+from . import asr as asr_mod
 from . import packaging as packaging_mod
-from .glossary import format_glossary_for_prompt, normalize_glossary
+from .glossary import (
+    apply_locked_terms,
+    format_glossary_for_prompt,
+    normalize_glossary,
+)
 from .state_machine import (
     InvalidTransitionError,
     PIPELINE_STEPS,
@@ -156,69 +165,50 @@ def step_asr(meta: Dict[str, Any]) -> Dict[str, Any]:
     video_path = inputs.get("video_path") or ""
     source_srt = artifact_path(task_id, "source.srt")
 
-    # 若用户已放置字幕则跳过识别
-    if os.path.isfile(source_srt) and os.path.getsize(source_srt) > 0:
+    # 若用户已放置真实字幕则跳过识别（占位字幕会重跑）
+    if (
+        os.path.isfile(source_srt)
+        and os.path.getsize(source_srt) > 0
+        and not asr_mod.is_placeholder_srt(source_srt)
+    ):
         append_log(meta, f"reuse existing source.srt: {source_srt}")
         meta["artifacts"]["source_srt"] = source_srt
+        meta["artifacts"]["asr_backend"] = inputs.get("asr_backend") or "uploaded"
         save_meta(meta)
         return transition(meta, "asr_done")
 
     # 尝试从同名 srt 复制
     if video_path:
         sibling = os.path.splitext(video_path)[0] + ".srt"
-        if os.path.isfile(sibling):
+        if os.path.isfile(sibling) and not asr_mod.is_placeholder_srt(sibling):
             shutil.copy2(sibling, source_srt)
             meta["artifacts"]["source_srt"] = source_srt
+            meta["artifacts"]["asr_backend"] = "sibling"
             append_log(meta, f"copied sibling subtitle: {sibling}")
             save_meta(meta)
             return transition(meta, "asr_done")
 
-    # 尝试 Whisper（可选）
-    try:
-        import whisper  # type: ignore
-
-        append_log(meta, "running local whisper ASR")
-        model_name = os.environ.get("CROSS_BORDER_WHISPER_MODEL", "small")
-        model = whisper.load_model(model_name)
-        language = (meta.get("source_lang") or None)
-        if language:
-            language = language[:2]
-        result = model.transcribe(video_path, language=language)
-        lines = []
-        for i, seg in enumerate(result.get("segments") or [], start=1):
-            start = _sec_to_srt(seg.get("start") or 0)
-            end = _sec_to_srt(seg.get("end") or 0)
-            text = (seg.get("text") or "").strip()
-            lines.extend([str(i), f"{start} --> {end}", text, ""])
-        write_text_artifact(task_id, "source.srt", "\n".join(lines).strip() + "\n")
-        meta["artifacts"]["source_srt"] = source_srt
-        save_meta(meta)
-        return transition(meta, "asr_done")
-    except Exception as exc:
-        append_log(meta, f"ASR auto path unavailable: {exc}", level="WARNING")
-
-    # 占位：允许用户稍后上传 source.srt
-    placeholder = (
-        "1\n00:00:00,000 --> 00:00:02,000\n"
-        "[ASR placeholder — replace source.srt with real subtitles]\n"
+    preferred = asr_mod.resolve_asr_backend(meta)
+    out_path, used_backend, attempt_logs = asr_mod.run_asr(
+        video_path=video_path,
+        subtitle_file=source_srt,
+        source_lang=meta.get("source_lang") or "",
+        preferred_backend=preferred,
     )
-    write_text_artifact(task_id, "source.srt", placeholder)
-    meta["artifacts"]["source_srt"] = source_srt
-    append_log(
-        meta,
-        "ASR placeholder written. Put real source.srt then retry translate/digest.",
-        level="WARNING",
-    )
+    for line in attempt_logs:
+        level = "WARNING" if "failed" in line.lower() or "placeholder" in line.lower() else "INFO"
+        append_log(meta, line, level=level)
+
+    meta["artifacts"]["source_srt"] = out_path or source_srt
+    meta["artifacts"]["asr_backend"] = used_backend
+    if used_backend == "placeholder":
+        append_log(
+            meta,
+            "ASR placeholder written. Upload real source.srt then retry from asr/translate.",
+            level="WARNING",
+        )
     save_meta(meta)
     return transition(meta, "asr_done")
-
-
-def _sec_to_srt(sec: float) -> str:
-    ms = int(round(float(sec) * 1000))
-    h, rem = divmod(ms, 3600_000)
-    m, rem = divmod(rem, 60_000)
-    s, milli = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
 
 
 def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,6 +220,12 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not os.path.isfile(source_srt):
         return _set_failed(meta, "source.srt missing before translate")
 
+    if asr_mod.is_placeholder_srt(source_srt):
+        return _set_failed(
+            meta,
+            "source.srt is still ASR placeholder; upload real subtitles before translate",
+        )
+
     # 已有目标字幕则复用
     if os.path.isfile(target_srt) and os.path.getsize(target_srt) > 10:
         meta["artifacts"]["target_srt"] = target_srt
@@ -238,7 +234,8 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
         return transition(meta, "translate_done")
 
     target_lang = meta.get("target_lang") or "zh"
-    glossary_block = format_glossary_for_prompt((meta.get("inputs") or {}).get("glossary"))
+    glossary_items = normalize_glossary((meta.get("inputs") or {}).get("glossary"))
+    glossary_block = format_glossary_for_prompt(glossary_items)
 
     lang_label = {
         "zh": "中文",
@@ -247,6 +244,16 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
         "ko": "한국어",
     }.get((target_lang or "zh")[:2].lower(), target_lang or "中文")
 
+    def _postprocess_and_save(text: str, via: str) -> Dict[str, Any]:
+        cleaned = apply_locked_terms(text or "", glossary_items)
+        write_text_artifact(task_id, "target.srt", cleaned.strip() + "\n")
+        meta["artifacts"]["target_srt"] = target_srt
+        append_log(meta, f"translated via {via}")
+        if glossary_items:
+            append_log(meta, f"glossary applied ({len(glossary_items)} terms)")
+        save_meta(meta)
+        return transition(meta, "translate_done")
+
     try:
         from app.services.subtitle_translator import translate_subtitle_file
 
@@ -254,18 +261,15 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
             source_srt,
             target_srt,
             target_language=lang_label,
+            glossary_block=glossary_block if glossary_items else "",
         )
-        # translate_subtitle_file may write a different path if output empty
         if out and os.path.isfile(out):
+            with open(out, encoding="utf-8") as fp:
+                translated_text = fp.read()
             if os.path.abspath(out) != os.path.abspath(target_srt):
-                shutil.copy2(out, target_srt)
-            meta["artifacts"]["target_srt"] = target_srt
-            append_log(meta, "translated via subtitle_translator")
-            # glossary note retained in logs for later prompt injection
-            if glossary_block:
-                append_log(meta, "glossary will be enforced mainly in digest/copy prompts")
-            save_meta(meta)
-            return transition(meta, "translate_done")
+                # postprocess writes to target_srt
+                pass
+            return _postprocess_and_save(translated_text, "subtitle_translator")
         raise RuntimeError("translate_subtitle_file returned empty path")
     except Exception as exc:
         append_log(meta, f"subtitle_translator failed: {exc}", level="WARNING")
@@ -285,11 +289,7 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
             fence = re.search(r"```(?:srt)?\s*([\s\S]*?)```", translated)
             if fence:
                 translated = fence.group(1).strip()
-            write_text_artifact(task_id, "target.srt", translated.strip() + "\n")
-            meta["artifacts"]["target_srt"] = target_srt
-            append_log(meta, "translated via LLM fallback")
-            save_meta(meta)
-            return transition(meta, "translate_done")
+            return _postprocess_and_save(translated, "LLM fallback")
         except Exception as exc2:
             shutil.copy2(source_srt, target_srt)
             meta["artifacts"]["target_srt"] = target_srt
@@ -351,6 +351,30 @@ def step_copy(meta: Dict[str, Any]) -> Dict[str, Any]:
     return transition(meta, "copy_done")
 
 
+def _normalize_script_items(items: List[Any], video_name: str) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for i, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        item = dict(item)
+        item.setdefault("_id", i)
+        item.setdefault("video_id", 1)
+        item.setdefault("video_name", video_name)
+        try:
+            item["OST"] = int(item.get("OST", 0) or 0)
+        except (TypeError, ValueError):
+            item["OST"] = 0
+        narration = str(item.get("narration") or "").strip()
+        # 「播放原片*」约定为原声轨；两边不一致时以文案标记为准
+        if narration.startswith("播放原片"):
+            item["OST"] = 1
+        if item["OST"] == 1 and not narration:
+            item["narration"] = f"播放原片{item['_id']}"
+        item["narration"] = str(item.get("narration") or "").strip()
+        normalized.append(item)
+    return normalized
+
+
 def step_match(meta: Dict[str, Any]) -> Dict[str, Any]:
     meta = transition(meta, "match_running")
     task_id = meta["task_id"]
@@ -378,22 +402,147 @@ def step_match(meta: Dict[str, Any]) -> Dict[str, Any]:
         items = data.get("items") if isinstance(data, dict) else data
         if not isinstance(items, list) or not items:
             raise ValueError("script items empty")
-        # 补默认字段
-        video_name = _video_basename(meta)
-        for i, item in enumerate(items, start=1):
-            if not isinstance(item, dict):
-                continue
-            item.setdefault("_id", i)
-            item.setdefault("video_id", 1)
-            item.setdefault("video_name", video_name)
-            item.setdefault("OST", 0)
+        items = _normalize_script_items(items, _video_basename(meta))
+        if not items:
+            raise ValueError("script items empty after normalize")
     except Exception as exc:
         return _set_failed(meta, f"script_matching failed: {exc}")
 
-    path = write_json_artifact(task_id, "script.json", {"items": items})
+    from . import compliance as compliance_mod
+
+    target_ratio = float((meta.get("inputs") or {}).get("original_audio_ratio") or 30)
+    actual_ratio = compliance_mod.estimate_original_audio_ratio(items)
+    meta["artifacts"]["ost_ratio"] = actual_ratio
+    if actual_ratio >= 0:
+        delta = abs(actual_ratio - target_ratio)
+        msg = f"OST ratio actual={actual_ratio}% target={target_ratio}%"
+        append_log(meta, msg, level="WARNING" if delta > 20 else "INFO")
+        if actual_ratio > target_ratio + 25:
+            append_log(
+                meta,
+                "原片占比偏高：建议人工删减 OST=1 段或补解说，以免改造度不足",
+                level="WARNING",
+            )
+        elif actual_ratio < max(0.0, target_ratio - 25):
+            append_log(
+                meta,
+                "原片占比偏低：高能原声可能被切掉，建议核对 High-energy Moments",
+                level="WARNING",
+            )
+
+    path = write_json_artifact(
+        task_id,
+        "script.json",
+        {
+            "items": items,
+            "ost_ratio": actual_ratio,
+            "target_original_audio_ratio": target_ratio,
+        },
+    )
     meta["artifacts"]["script_json"] = path
     save_meta(meta)
     return transition(meta, "match_done")
+
+
+def _default_voice_name(meta: Dict[str, Any]) -> str:
+    voice = str((meta.get("inputs") or {}).get("voice_name") or "").strip()
+    if voice:
+        return voice
+    if (meta.get("target_lang") or "zh").startswith("zh"):
+        return "zh-CN-XiaoyiNeural"
+    return "en-US-JennyNeural"
+
+
+def _default_tts_engine(meta: Dict[str, Any]) -> str:
+    engine = str((meta.get("inputs") or {}).get("tts_engine") or "").strip()
+    if engine:
+        return engine
+    try:
+        from app.config import config
+
+        return str(config.app.get("tts_engine") or "edge_tts")
+    except Exception:
+        return "edge_tts"
+
+
+def _generate_tts_with_voice_service(
+    *,
+    items: List[Dict[str, Any]],
+    tts_dir: str,
+    voice_name: str,
+    tts_engine: str,
+    voice_rate: float,
+    voice_pitch: float,
+) -> List[Dict[str, Any]]:
+    from app.services import voice as voice_svc
+
+    results: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or int(item.get("OST", 0) or 0) == 1:
+            continue
+        text = str(item.get("narration") or "").strip()
+        if not text or text.startswith("播放原片"):
+            continue
+        item_id = int(item.get("_id") or 0)
+        out = os.path.join(tts_dir, f"{item_id:04d}.mp3")
+        sub_maker = voice_svc.tts(
+            text=text,
+            voice_name=voice_name,
+            voice_rate=voice_rate,
+            voice_pitch=voice_pitch,
+            voice_file=out,
+            tts_engine=tts_engine,
+        )
+        if sub_maker is None or not os.path.isfile(out):
+            raise RuntimeError(f"voice.tts failed for item {item_id}")
+        results.append(
+            {
+                "_id": item_id,
+                "timestamp": item.get("timestamp"),
+                "audio_file": out,
+                "engine": tts_engine,
+                "voice_name": voice_name,
+            }
+        )
+    return results
+
+
+def _generate_tts_with_edge(
+    *,
+    items: List[Dict[str, Any]],
+    tts_dir: str,
+    voice_name: str,
+) -> List[Dict[str, Any]]:
+    import asyncio
+    import edge_tts  # type: ignore
+
+    async def _one(text: str, out_path: str, v: str):
+        communicate = edge_tts.Communicate(text, v)
+        await communicate.save(out_path)
+
+    async def _all():
+        results: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or int(item.get("OST", 0) or 0) == 1:
+                continue
+            text = str(item.get("narration") or "").strip()
+            if not text or text.startswith("播放原片"):
+                continue
+            item_id = int(item.get("_id") or 0)
+            out = os.path.join(tts_dir, f"{item_id:04d}.mp3")
+            await _one(text, out, voice_name)
+            results.append(
+                {
+                    "_id": item_id,
+                    "timestamp": item.get("timestamp"),
+                    "audio_file": out,
+                    "engine": "edge_tts",
+                    "voice_name": voice_name,
+                }
+            )
+        return results
+
+    return asyncio.run(_all())
 
 
 def step_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -404,55 +553,66 @@ def step_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
     meta["artifacts"]["tts_dir"] = tts_dir
 
     script_path = meta["artifacts"].get("script_json") or artifact_path(task_id, "script.json")
-    items = []
+    items: List[Dict[str, Any]] = []
     if os.path.isfile(script_path):
         with open(script_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        items = data.get("items") if isinstance(data, dict) else data
+        raw_items = data.get("items") if isinstance(data, dict) else data
+        items = [x for x in (raw_items or []) if isinstance(x, dict)]
 
-    voice = (meta.get("inputs") or {}).get("voice_name") or ""
-    generated = 0
+    if not items:
+        append_log(meta, "no script items for tts", level="WARNING")
+        save_meta(meta)
+        return transition(meta, "tts_done")
+
+    voice_name = _default_voice_name(meta)
+    tts_engine = _default_tts_engine(meta)
+    voice_rate = float((meta.get("inputs") or {}).get("voice_rate") or 1.0)
+    voice_pitch = float((meta.get("inputs") or {}).get("voice_pitch") or 1.0)
+    results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
     try:
-        # 尝试 edge-tts 批量（可选）
-        import asyncio
-        import edge_tts  # type: ignore
-
-        async def _one(text: str, out_path: str, voice_name: str):
-            communicate = edge_tts.Communicate(text, voice_name)
-            await communicate.save(out_path)
-
-        async def _all():
-            nonlocal generated
-            for item in items:
-                if not isinstance(item, dict) or int(item.get("OST", 0) or 0) == 1:
-                    continue
-                text = str(item.get("narration") or "").strip()
-                if not text or text.startswith("播放原片"):
-                    continue
-                out = os.path.join(tts_dir, f"{int(item.get('_id') or 0):04d}.mp3")
-                v = voice or (
-                    "zh-CN-XiaoyiNeural"
-                    if (meta.get("target_lang") or "zh").startswith("zh")
-                    else "en-US-JennyNeural"
-                )
-                await _one(text, out, v)
-                generated += 1
-
-        if items:
-            asyncio.run(_all())
-            append_log(meta, f"edge-tts generated {generated} clips")
-        else:
-            append_log(meta, "no script items for tts", level="WARNING")
+        results = _generate_tts_with_voice_service(
+            items=items,
+            tts_dir=tts_dir,
+            voice_name=voice_name,
+            tts_engine=tts_engine,
+            voice_rate=voice_rate,
+            voice_pitch=voice_pitch,
+        )
+        append_log(
+            meta,
+            f"voice service ({tts_engine}) generated {len(results)} clips with {voice_name}",
+        )
     except Exception as exc:
-        # 占位
-        note = os.path.join(tts_dir, "README.txt")
-        with open(note, "w", encoding="utf-8") as f:
-            f.write(
-                "TTS not generated in this environment.\n"
-                f"reason: {exc}\n"
-                "Pipeline continues; wire app.services.voice later for production.\n"
+        errors.append(f"voice service: {exc}")
+        append_log(meta, f"voice.tts failed, fallback edge-tts: {exc}", level="WARNING")
+        try:
+            # edge 路径强制用 edge 可用音色
+            edge_voice = voice_name
+            if not edge_voice or not any(x in edge_voice for x in ("Neural", "zh-", "en-")):
+                edge_voice = _default_voice_name({**meta, "inputs": {**(meta.get("inputs") or {}), "voice_name": ""}})
+            results = _generate_tts_with_edge(
+                items=items,
+                tts_dir=tts_dir,
+                voice_name=edge_voice,
             )
-        append_log(meta, f"tts placeholder: {exc}", level="WARNING")
+            append_log(meta, f"edge-tts generated {len(results)} clips with {edge_voice}")
+        except Exception as exc2:
+            errors.append(f"edge-tts: {exc2}")
+            note = os.path.join(tts_dir, "README.txt")
+            with open(note, "w", encoding="utf-8") as f:
+                f.write(
+                    "TTS not generated in this environment.\n"
+                    f"errors: {errors}\n"
+                    "Pipeline continues; check voice engine config / network.\n"
+                )
+            append_log(meta, f"tts placeholder: {errors}", level="WARNING")
+
+    if results:
+        write_json_artifact(task_id, "tts_manifest.json", {"clips": results})
+        meta["artifacts"]["tts_manifest"] = artifact_path(task_id, "tts_manifest.json")
 
     save_meta(meta)
     return transition(meta, "tts_done")
