@@ -621,31 +621,92 @@ def step_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
 def step_render(meta: Dict[str, Any]) -> Dict[str, Any]:
     meta = transition(meta, "render_running")
     task_id = meta["task_id"]
-    # MVP：不强制接完整合成；写占位说明，保留 video 路径引用
-    output = artifact_path(task_id, "output.mp4")
     video_path = (meta.get("inputs") or {}).get("video_path") or ""
-    if video_path and os.path.isfile(video_path):
-        # 不复制大文件，只记源路径；若需要可后续接 generate_video
-        meta["artifacts"]["output_mp4"] = video_path
+    output = artifact_path(task_id, "output.mp4")
+    work_dir = artifact_path(task_id, "render")
+    os.makedirs(work_dir, exist_ok=True)
+
+    script_path = meta["artifacts"].get("script_json") or artifact_path(task_id, "script.json")
+    tts_dir = meta["artifacts"].get("tts_dir") or artifact_path(task_id, "tts")
+    manifest_path = meta["artifacts"].get("tts_manifest") or artifact_path(
+        task_id, "tts_manifest.json"
+    )
+
+    try:
+        from . import render as render_mod
+
+        items = render_mod._load_script_items(script_path)
+        if not items:
+            raise ValueError("script.json empty or missing")
+        if not video_path or not os.path.isfile(video_path):
+            raise FileNotFoundError("source video missing")
+
+        tts_results = render_mod.build_tts_results_from_manifest(
+            items=items,
+            tts_dir=tts_dir,
+            manifest_path=manifest_path,
+        )
+        # 无 TTS 但仍有 OST=1 片段时，允许纯原片拼接
+        has_ost1 = any(int(i.get("OST", 0) or 0) == 1 for i in items)
+        if not tts_results and not has_ost1:
+            raise RuntimeError("no tts clips and no OST=1 segments; cannot render")
+
+        aspect = "16:9"
+        # 竖屏平台默认 9:16
+        platform = str((meta.get("inputs") or {}).get("platform") or "").lower()
+        if platform in {"douyin", "tiktok", "reels", "shorts"}:
+            aspect = "9:16"
+
+        final_path, debug = render_mod.render_final_video(
+            task_id=task_id,
+            video_path=video_path,
+            script_items=items,
+            tts_results=tts_results,
+            work_dir=work_dir,
+            output_mp4=output,
+            video_aspect=aspect,
+            subtitle_enabled=False,
+            voice_volume=1.0,
+            original_volume=1.0,
+        )
+        # 同步一份到 export
+        export_dir = meta["artifacts"].get("export_dir") or artifact_path(task_id, "export")
+        os.makedirs(export_dir, exist_ok=True)
+        export_mp4 = os.path.join(export_dir, "output.mp4")
+        try:
+            if os.path.abspath(final_path) != os.path.abspath(export_mp4):
+                shutil.copy2(final_path, export_mp4)
+        except Exception as copy_exc:
+            append_log(meta, f"export copy skipped: {copy_exc}", level="WARNING")
+            export_mp4 = final_path
+
+        meta["artifacts"]["output_mp4"] = export_mp4 if os.path.isfile(export_mp4) else final_path
+        write_json_artifact(task_id, "render_debug.json", debug)
+        meta["artifacts"]["render_debug"] = artifact_path(task_id, "render_debug.json")
         append_log(
             meta,
-            "render skeleton: using source video path as output reference; "
-            "hook app.services.generate_video for real cut later",
-            level="WARNING",
+            f"render ok: clips={debug.get('clip_count')} tts={debug.get('tts_count')} "
+            f"-> {meta['artifacts']['output_mp4']}",
         )
-    else:
+        save_meta(meta)
+        return transition(meta, "render_done")
+    except Exception as exc:
+        # 骨架回退：不伪造 mp4，保留源路径引用
+        append_log(meta, f"render failed, fallback skeleton: {exc}", level="WARNING")
+        traceback_msg = traceback.format_exc()
+        append_log(meta, traceback_msg[-1500:], level="WARNING")
         write_text_artifact(
             task_id,
             "output_pending.txt",
-            "Render not run: missing source video or renderer not wired.\n",
+            f"Render failed or skipped.\nreason: {exc}\n"
+            "Check script/tts/ffmpeg. Source video kept as reference.\n",
         )
-        meta["artifacts"]["output_mp4"] = ""
-        append_log(meta, "render skipped: no video", level="WARNING")
-    # 不伪造 mp4 二进制
-    if not meta["artifacts"].get("output_mp4"):
-        meta["artifacts"]["output_mp4"] = output if os.path.isfile(output) else ""
-    save_meta(meta)
-    return transition(meta, "render_done")
+        if video_path and os.path.isfile(video_path):
+            meta["artifacts"]["output_mp4"] = video_path
+        else:
+            meta["artifacts"]["output_mp4"] = ""
+        save_meta(meta)
+        return transition(meta, "render_done")
 
 
 def step_packaging(meta: Dict[str, Any]) -> Dict[str, Any]:

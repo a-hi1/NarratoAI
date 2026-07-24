@@ -474,6 +474,19 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
     export_dir = artifacts.get("export_dir") or ""
     if export_dir and os.path.isdir(export_dir):
         st.caption(f"导出目录: {export_dir}")
+    out_mp4 = artifacts.get("output_mp4") or ""
+    if out_mp4 and os.path.isfile(out_mp4):
+        st.markdown("#### 成片")
+        st.caption(out_mp4)
+        try:
+            st.video(out_mp4)
+        except Exception:
+            st.info("成片已生成，当前环境无法内嵌预览，请打开路径查看。")
+        if st.button("打开导出目录", key="cb_open_export"):
+            try:
+                os.startfile(export_dir or os.path.dirname(out_mp4))  # type: ignore[attr-defined]
+            except Exception as exc:
+                st.warning(f"无法打开目录: {exc}")
 
 
 def _render_task_list(tr):

@@ -510,6 +510,99 @@ class PipelineSkeletonTests(unittest.TestCase):
         self.assertEqual(items[2]["narration"], "正常解说")
 
 
+class RenderHelperTests(unittest.TestCase):
+    def test_build_tts_results_from_manifest(self):
+        from app.services.cross_border import render as render_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = os.path.join(tmp, "0001.mp3")
+            with open(audio, "wb") as f:
+                f.write(b"ID3" + b"\x00" * 20000)
+            manifest = os.path.join(tmp, "tts_manifest.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "clips": [
+                            {
+                                "_id": 1,
+                                "audio_file": audio,
+                                "timestamp": "00:00:00,000-00:00:03,000",
+                            }
+                        ]
+                    },
+                    f,
+                )
+            items = [
+                {
+                    "_id": 1,
+                    "OST": 0,
+                    "narration": "hello",
+                    "timestamp": "00:00:00,000-00:00:03,000",
+                },
+                {
+                    "_id": 2,
+                    "OST": 1,
+                    "narration": "播放原片2",
+                    "timestamp": "00:00:03,000-00:00:06,000",
+                },
+            ]
+            results = render_mod.build_tts_results_from_manifest(
+                items=items, tts_dir=tmp, manifest_path=manifest
+            )
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["_id"], 1)
+            self.assertGreater(results[0]["duration"], 0)
+
+    def test_step_render_fallback_on_missing_video(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=os.path.join(tmp, "missing.mp4"),
+                )
+                task_store.write_json_artifact(
+                    meta["task_id"],
+                    "script.json",
+                    {
+                        "items": [
+                            {
+                                "_id": 1,
+                                "OST": 0,
+                                "narration": "hi",
+                                "timestamp": "00:00:00,000-00:00:02,000",
+                            }
+                        ]
+                    },
+                )
+                meta["artifacts"]["script_json"] = task_store.artifact_path(
+                    meta["task_id"], "script.json"
+                )
+                for st in (
+                    "queued",
+                    "asr_running",
+                    "asr_done",
+                    "translate_running",
+                    "translate_done",
+                    "digest_running",
+                    "digest_done",
+                    "copy_running",
+                    "copy_done",
+                    "match_running",
+                    "match_done",
+                    "tts_running",
+                    "tts_done",
+                ):
+                    meta = task_store.transition(meta, st)
+                result = cb_pipeline.step_render(meta)
+                # 失败回退仍标记 render_done，保证流水线可到 packaging
+                self.assertEqual(result["status"], "render_done")
+                self.assertTrue(
+                    any("fallback" in (x.get("message") or "").lower() for x in result.get("logs") or [])
+                )
+
+
 def _fake_translate(meta, sample_srt):
     from app.services.cross_border.task_store import (
         save_meta,
