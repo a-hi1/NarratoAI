@@ -45,6 +45,47 @@ LANG_LABELS: Dict[str, str] = {
     "hi": "印地语 Hindi",
 }
 
+# 给 LLM 字幕翻译用的目标语名称（尽量用目标语自称，翻译更稳）
+LANG_TRANSLATE_NAMES: Dict[str, str] = {
+    "zh": "中文",
+    "en": "English",
+    "ja": "日本語",
+    "ko": "한국어",
+    "es": "español",
+    "fr": "français",
+    "de": "Deutsch",
+    "pt": "português",
+    "it": "italiano",
+    "ru": "русский",
+    "vi": "tiếng Việt",
+    "th": "ภาษาไทย",
+    "id": "Bahasa Indonesia",
+    "ar": "العربية",
+    "hi": "हिन्दी",
+}
+
+# 新建任务常用语对快捷（源, 目标, 中文标签）
+COMMON_LANG_PAIRS: Tuple[Tuple[str, str, str], ...] = (
+    ("en", "zh", "英语 → 中文（引入）"),
+    ("zh", "en", "中文 → 英语（出海）"),
+    ("en", "ja", "英语 → 日语"),
+    ("zh", "ja", "中文 → 日语"),
+    ("ja", "zh", "日语 → 中文"),
+    ("en", "ko", "英语 → 韩语"),
+    ("zh", "ko", "中文 → 韩语"),
+    ("ko", "zh", "韩语 → 中文"),
+    ("en", "es", "英语 → 西语"),
+    ("zh", "es", "中文 → 西语"),
+    ("en", "fr", "英语 → 法语"),
+    ("en", "de", "英语 → 德语"),
+    ("en", "pt", "英语 → 葡语"),
+    ("en", "vi", "英语 → 越南语"),
+    ("en", "th", "英语 → 泰语"),
+    ("en", "id", "英语 → 印尼语"),
+    ("en", "ar", "英语 → 阿拉伯语"),
+    ("en", "hi", "英语 → 印地语"),
+)
+
 # 每语默认 Edge 音色（女声优先，可被 inputs.voice_name 覆盖）
 DEFAULT_EDGE_VOICES: Dict[str, str] = {
     "zh": "zh-CN-XiaoyiNeural",
@@ -123,6 +164,36 @@ def normalize_lang(code: str, fallback: str = "en") -> str:
 
 def lang_choices_for_ui() -> List[Tuple[str, str]]:
     return [(code, LANG_LABELS.get(code, code)) for code in SUPPORTED_LANGS]
+
+
+def translate_language_name(code: str, fallback: str = "") -> str:
+    """
+    字幕/文案翻译时传给 LLM 的目标语名称。
+    例：ja → 日本語；未知码原样返回。
+    """
+    lang = normalize_lang(code, fallback=(fallback or "zh")[:2] or "zh")
+    return LANG_TRANSLATE_NAMES.get(lang) or LANG_LABELS.get(lang) or lang
+
+
+def pair_choices_for_ui() -> List[Tuple[str, str, str]]:
+    """返回 (source, target, label)。"""
+    return list(COMMON_LANG_PAIRS)
+
+
+def detect_direction_for_pair(source_lang: str, target_lang: str) -> str:
+    """
+    粗分方向：目标为中文 → inbound；源为中文 → outbound；其它默认 outbound。
+    仅影响风格包/平台默认，不限制语对。
+    """
+    src = normalize_lang(source_lang, fallback="en")
+    tgt = normalize_lang(target_lang, fallback="zh")
+    if tgt == "zh" and src != "zh":
+        return "inbound"
+    if src == "zh" and tgt != "zh":
+        return "outbound"
+    if tgt == "zh":
+        return "inbound"
+    return "outbound"
 
 
 def default_voice_for_lang(lang: str, *, gender: str = "female") -> str:

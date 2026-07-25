@@ -254,10 +254,13 @@ def create_task(
         source_lang = source_lang or "zh"
         target_lang = target_lang or "en"
 
-    # MVP 锁定 en↔zh
-    pair = {source_lang.lower()[:2], target_lang.lower()[:2]}
-    if pair != {"en", "zh"}:
-        logger.warning(f"MVP prefers en↔zh, got {source_lang}->{target_lang}")
+    # 多语已支持（字幕翻译 + 配音 TTS）；仅打 debug 方便排查奇怪语码
+    src2 = (source_lang or "").lower()[:2]
+    tgt2 = (target_lang or "").lower()[:2]
+    if src2 and tgt2 and src2 == tgt2:
+        logger.warning(f"source_lang == target_lang == {src2}; translation may be no-op")
+    elif src2 and tgt2:
+        logger.info(f"lang pair: {src2} → {tgt2}")
 
     pack = resolve_style_pack(direction, style_pack or None)
     if original_audio_ratio is None:

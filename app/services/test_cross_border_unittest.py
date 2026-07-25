@@ -1148,6 +1148,12 @@ class DubbingModuleTests(unittest.TestCase):
         self.assertEqual(voices_mod.normalize_lang("EN_us"), "en")
         self.assertEqual(voices_mod.normalize_lang("xx", fallback="ja"), "ja")
         self.assertTrue(voices_mod.default_voice_for_lang("ja").startswith("ja-"))
+        self.assertEqual(voices_mod.translate_language_name("ja"), "日本語")
+        self.assertEqual(voices_mod.translate_language_name("ko"), "한국어")
+        self.assertEqual(voices_mod.detect_direction_for_pair("en", "ja"), "outbound")
+        self.assertEqual(voices_mod.detect_direction_for_pair("ja", "zh"), "inbound")
+        pairs = voices_mod.pair_choices_for_ui()
+        self.assertTrue(any(s == "en" and t == "ja" for s, t, _ in pairs))
         self.assertIn("Guy", voices_mod.default_voice_for_lang("en", gender="male"))
         codes = [c for c, _ in voices_mod.lang_choices_for_ui()]
         self.assertIn("zh", codes)

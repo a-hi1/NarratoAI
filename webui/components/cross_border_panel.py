@@ -510,32 +510,131 @@ def _render_create_form(tr):
     else:
         mode = "narration"
 
-    direction_label = st.radio(
-        "② 选择方向",
-        options=["引入 Inbound（en→zh）", "出海 Outbound（zh→en）"],
-        horizontal=True,
-        key="cb_direction_label",
-        help="引入：外网英文片 → 中文字幕；出海：国内中文片 → 英文字幕。",
-    )
-    direction = "inbound" if direction_label.startswith("引入") else "outbound"
+    from app.services.cross_border.dubbing import voices as voices_mod
 
-    # Streamlit 带 key 的输入框会锁定 session_state；切换方向时必须同步语对/默认音色等
-    if st.session_state.get("cb_direction_synced") != direction:
+    pair_choices = voices_mod.pair_choices_for_ui()
+    # (source, target, label) → 用 "src|tgt" 做 key，避免 index 漂移
+    pair_keys = [f"{s}|{t}" for s, t, _ in pair_choices]
+    pair_label_map = {f"{s}|{t}": lab for s, t, lab in pair_choices}
+    # 自定义入口
+    pair_keys.append("custom")
+    pair_label_map["custom"] = "自定义语对…"
+
+    if "cb_lang_pair" not in st.session_state:
+        st.session_state["cb_lang_pair"] = "en|zh"
+    if st.session_state["cb_lang_pair"] not in pair_keys:
+        st.session_state["cb_lang_pair"] = "en|zh"
+
+    pair_key = st.selectbox(
+        "② 语对（源语言 → 目标语言）",
+        options=pair_keys,
+        format_func=lambda k: pair_label_map.get(k, k),
+        key="cb_lang_pair",
+        help=(
+            "字幕本地化与多语配音均支持多语：日/韩/西/法/德等。"
+            " 选「英语→日语」即可把英文字幕译成日语并烧录；"
+            " 引入/出海仅影响默认风格与平台推荐，不再限制语种。"
+        ),
+    )
+
+    lang_codes = [c for c, _ in voices_mod.lang_choices_for_ui()]
+    lang_label_map = dict(voices_mod.lang_choices_for_ui())
+
+    if pair_key == "custom":
+        c_src, c_tgt = st.columns(2)
+        with c_src:
+            if "cb_source_lang" not in st.session_state:
+                st.session_state["cb_source_lang"] = "en"
+            src_cur = (st.session_state.get("cb_source_lang") or "en")[:2]
+            try:
+                src_idx = lang_codes.index(src_cur)
+            except ValueError:
+                src_idx = 0
+            source_lang = st.selectbox(
+                "源语言",
+                options=lang_codes,
+                format_func=lambda c: lang_label_map.get(c, c),
+                index=src_idx,
+                key="cb_source_lang_pick",
+            )
+            st.session_state["cb_source_lang"] = source_lang
+        with c_tgt:
+            if "cb_target_lang" not in st.session_state:
+                st.session_state["cb_target_lang"] = "ja"
+            tgt_cur = (st.session_state.get("cb_target_lang") or "ja")[:2]
+            try:
+                tgt_idx = lang_codes.index(tgt_cur)
+            except ValueError:
+                tgt_idx = lang_codes.index("ja") if "ja" in lang_codes else 0
+            target_lang = st.selectbox(
+                "目标语言",
+                options=lang_codes,
+                format_func=lambda c: lang_label_map.get(c, c),
+                index=tgt_idx,
+                key="cb_target_lang_pick_main",
+            )
+            st.session_state["cb_target_lang"] = target_lang
+    else:
+        source_lang, target_lang = pair_key.split("|", 1)
+        # 同步 session，供配音音色筛选 / 高级区回显
+        if st.session_state.get("cb_source_lang") != source_lang:
+            st.session_state["cb_source_lang"] = source_lang
+        if st.session_state.get("cb_target_lang") != target_lang:
+            st.session_state["cb_target_lang"] = target_lang
+            # 目标语变了 → 配音音色预设重筛
+            st.session_state.pop("cb_voice_sync_key", None)
+
+    source_lang = voices_mod.normalize_lang(
+        st.session_state.get("cb_source_lang") or source_lang or "en",
+        fallback="en",
+    )
+    target_lang = voices_mod.normalize_lang(
+        st.session_state.get("cb_target_lang") or target_lang or "zh",
+        fallback="zh",
+    )
+    direction = voices_mod.detect_direction_for_pair(source_lang, target_lang)
+
+    # 方向相关默认（平台/字数/OST）；仅在语对变化时写一次，避免覆盖用户手改
+    pair_sync_key = f"{source_lang}|{target_lang}|{direction}"
+    if st.session_state.get("cb_direction_synced") != pair_sync_key:
         if direction == "inbound":
-            st.session_state["cb_source_lang"] = "en"
-            st.session_state["cb_target_lang"] = "zh"
-            st.session_state["cb_voice_name"] = "zh-CN-XiaoyiNeural"
-            st.session_state["cb_platform"] = "douyin"
-            st.session_state["cb_word_count"] = 320
-            st.session_state["cb_ost_ratio"] = 30
+            st.session_state.setdefault("cb_platform", "douyin")
+            if "cb_word_count" not in st.session_state or st.session_state.get(
+                "_cb_word_from_pair"
+            ) != pair_sync_key:
+                st.session_state["cb_word_count"] = 320
+            if "cb_ost_ratio" not in st.session_state or st.session_state.get(
+                "_cb_ost_from_pair"
+            ) != pair_sync_key:
+                st.session_state["cb_ost_ratio"] = 30
         else:
-            st.session_state["cb_source_lang"] = "zh"
-            st.session_state["cb_target_lang"] = "en"
-            st.session_state["cb_voice_name"] = "en-US-JennyNeural"
-            st.session_state["cb_platform"] = "tiktok"
-            st.session_state["cb_word_count"] = 150
-            st.session_state["cb_ost_ratio"] = 20
-        st.session_state["cb_direction_synced"] = direction
+            st.session_state.setdefault("cb_platform", "tiktok")
+            if "cb_word_count" not in st.session_state or st.session_state.get(
+                "_cb_word_from_pair"
+            ) != pair_sync_key:
+                st.session_state["cb_word_count"] = 150
+            if "cb_ost_ratio" not in st.session_state or st.session_state.get(
+                "_cb_ost_from_pair"
+            ) != pair_sync_key:
+                st.session_state["cb_ost_ratio"] = 20
+        # 配音默认音色跟目标语
+        default_voice = voices_mod.default_voice_for_lang(target_lang, gender="female")
+        # 仅当当前音色与目标语不匹配时才改，避免覆盖用户精选
+        cur_voice = (st.session_state.get("cb_voice_name") or "").strip()
+        vlang = voices_mod.voice_lang(cur_voice) if cur_voice else None
+        if not cur_voice or (vlang and vlang != target_lang):
+            st.session_state["cb_voice_name"] = default_voice
+            st.session_state.pop("cb_voice_sync_key", None)
+        st.session_state["cb_direction_synced"] = pair_sync_key
+        st.session_state["_cb_word_from_pair"] = pair_sync_key
+        st.session_state["_cb_ost_from_pair"] = pair_sync_key
+
+    st.caption(
+        f"当前：**{lang_label_map.get(source_lang, source_lang)} → "
+        f"{lang_label_map.get(target_lang, target_lang)}**"
+        f"（{('引入' if direction == 'inbound' else '出海')} · 字幕将译为"
+        f"**{voices_mod.translate_language_name(target_lang)}**）"
+    )
 
     st.markdown("**③ 准备素材**")
     source_mode = st.radio(
@@ -992,7 +1091,8 @@ def _render_create_form(tr):
         asr_backend = "auto"
 
     # 解说工厂专属（不要覆盖配音 expander 已写入的 voice_name / tts_engine）
-    style_pack = DEFAULT_BY_DIRECTION[direction]
+    # source_lang / target_lang / direction 已在上方「② 语对」确定，这里不再强制 en↔zh
+    style_pack = DEFAULT_BY_DIRECTION.get(direction) or DEFAULT_BY_DIRECTION["inbound"]
     duration_mode = "keep"
     original_audio_ratio = 30 if direction == "inbound" else 20
     source_credit = True
@@ -1001,13 +1101,9 @@ def _render_create_form(tr):
     platform = "douyin" if direction == "inbound" else "tiktok"
     narration_word_count = 320 if direction == "inbound" else 150
     stop_at_copy = True
-    if direction == "inbound":
-        source_lang, target_lang = "en", "zh"
-    else:
-        source_lang, target_lang = "zh", "en"
     # 非配音模式才给默认音色；配音已在「④ 配音与字幕样式」里选好
     if mode != "dubbing":
-        voice_name = "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
+        voice_name = voices_mod.default_voice_for_lang(target_lang, gender="female")
         if mode != "narration":
             tts_engine = tts_engine or ""
 
@@ -1059,48 +1155,48 @@ def _render_create_form(tr):
         )
 
     with st.expander("高级", expanded=False):
-        # 语对随方向自动切换（见上方 cb_direction_synced）；此处只读 session / 允许手改
-        expected_pair = "en → zh" if direction == "inbound" else "zh → en"
         st.caption(
-            f"当前方向：**{_DIRECTION_CN.get(direction, direction)}**，默认语对 **{expected_pair}**。"
-            " 切换「引入/出海」会自动改源/目标语言；仍可在下面手改。"
+            f"当前语对：**{source_lang} → {target_lang}**"
+            f"（{('引入' if direction == 'inbound' else '出海')}）。"
+            " 要换语种请回上方「② 语对」；此处可手改 ISO 码（如 ja / ko / es）。"
         )
         c1, c2 = st.columns(2)
         with c1:
-            # 不用 value= 抢 key：由 session_state 驱动，避免方向切换后仍显示旧值
             if "cb_source_lang" not in st.session_state:
                 st.session_state["cb_source_lang"] = source_lang
-            source_lang = st.text_input("源语言", key="cb_source_lang")
+            source_lang_raw = st.text_input("源语言（ISO）", key="cb_source_lang")
+            source_lang = voices_mod.normalize_lang(source_lang_raw, fallback=source_lang)
         with c2:
             if "cb_target_lang" not in st.session_state:
                 st.session_state["cb_target_lang"] = target_lang
-            target_lang = st.text_input("目标语言", key="cb_target_lang")
+            target_lang_raw = st.text_input("目标语言（ISO）", key="cb_target_lang")
+            new_tgt = voices_mod.normalize_lang(target_lang_raw, fallback=target_lang)
+            if new_tgt != target_lang:
+                st.session_state.pop("cb_voice_sync_key", None)
+            target_lang = new_tgt
+            direction = voices_mod.detect_direction_for_pair(source_lang, target_lang)
         if mode == "dubbing":
-            from app.services.cross_border.dubbing import voices as voices_mod
-
             lang_choices = voices_mod.lang_choices_for_ui()
-            lang_codes = [c for c, _ in lang_choices]
-            # 目标语快捷选择（音色控件已在上方 expander，这里只改语种）
+            lang_codes_adv = [c for c, _ in lang_choices]
             cur_tgt = (st.session_state.get("cb_target_lang") or target_lang or "en")[:2]
             try:
-                tgt_idx = lang_codes.index(cur_tgt)
+                tgt_idx = lang_codes_adv.index(cur_tgt)
             except ValueError:
-                tgt_idx = lang_codes.index("en") if "en" in lang_codes else 0
+                tgt_idx = lang_codes_adv.index("en") if "en" in lang_codes_adv else 0
             pick = st.selectbox(
                 "目标语种（快捷）",
-                options=list(range(len(lang_codes))),
+                options=list(range(len(lang_codes_adv))),
                 format_func=lambda i: lang_choices[i][1],
                 index=tgt_idx,
                 key="cb_target_lang_pick",
                 help="选择后会写入目标语言；上方「配音音色」预设会按新语种刷新。",
             )
-            picked_lang = lang_codes[int(pick)]
+            picked_lang = lang_codes_adv[int(pick)]
             if st.session_state.get("cb_target_lang") != picked_lang:
                 st.session_state["cb_target_lang"] = picked_lang
                 target_lang = picked_lang
-                # 语种变了 → 下次渲染按新语重筛音色预设
+                direction = voices_mod.detect_direction_for_pair(source_lang, target_lang)
                 st.session_state.pop("cb_voice_sync_key", None)
-            # 从 session 回读 expander 已选的音色/引擎（避免被默认值覆盖）
             voice_name = (st.session_state.get("cb_voice_name") or voice_name or "").strip()
             tts_engine = st.session_state.get("cb_tts_engine_dub", tts_engine)
             voice_rate = float(st.session_state.get("cb_voice_rate") or voice_rate or 1.0)

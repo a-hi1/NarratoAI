@@ -301,12 +301,19 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
     glossary_items = normalize_glossary((meta.get("inputs") or {}).get("glossary"))
     glossary_block = format_glossary_for_prompt(glossary_items)
 
-    lang_label = {
-        "zh": "中文",
-        "en": "English",
-        "ja": "日本語",
-        "ko": "한국어",
-    }.get((target_lang or "zh")[:2].lower(), target_lang or "中文")
+    # 多语：ja/ko/es… 都给 LLM 明确目标语名（不仅 en↔zh）
+    try:
+        from .dubbing.voices import translate_language_name
+
+        lang_label = translate_language_name(target_lang, fallback="zh")
+    except Exception:
+        lang_label = {
+            "zh": "中文",
+            "en": "English",
+            "ja": "日本語",
+            "ko": "한국어",
+        }.get((target_lang or "zh")[:2].lower(), target_lang or "中文")
+    append_log(meta, f"translate target_lang={target_lang} → {lang_label}")
 
     def _postprocess_and_save(text: str, via: str) -> Dict[str, Any]:
         cleaned = apply_locked_terms(text or "", glossary_items)
