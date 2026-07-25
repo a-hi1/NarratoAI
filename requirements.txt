@@ -28,8 +28,11 @@ tenacity>=9.0.0
 # 如果使用 TwelveLabs Pegasus 视频理解作为视觉提供商，取消注释下面的行
 # twelvelabs>=1.2.8
 
-# 如果需要本地语音识别，取消注释下面的行
-# faster-whisper>=1.0.1
+# 跨境字幕本地化默认 ASR（只丢视频也能出字幕）
+faster-whisper>=1.0.1
+
+# 跨境：从 YouTube 等公开链接取片（可选功能，UI 有降级提示）
+yt-dlp>=2024.8.0
 
 # 如果需要 OpenCV 图像处理，取消注释下面的行
 # opencv-python>=4.11.0.86

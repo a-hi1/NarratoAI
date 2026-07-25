@@ -6,6 +6,7 @@ def render_video_panel(tr):
     """渲染视频配置面板"""
     with st.container(border=True):
         st.write(tr("Video Settings"))
+        st.caption("画幅与清晰度影响成片体积；默认 1080p 即可。")
         params = VideoClipParams()
         render_video_config(tr, params)
 

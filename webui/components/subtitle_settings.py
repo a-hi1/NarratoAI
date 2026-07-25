@@ -59,6 +59,7 @@ def render_subtitle_panel(tr):
     """渲染字幕设置面板"""
     with st.container(border=True):
         st.write(tr("Subtitle Settings"))
+        st.caption("解说成片字幕样式。跨境硬烧字幕请到「跨境本地化」任务详情改。")
 
         tts_engine = config.ui.get('tts_engine', '')
         is_disabled_subtitle = is_disabled_subtitle_settings(tts_engine)

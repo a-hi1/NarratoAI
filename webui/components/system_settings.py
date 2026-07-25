@@ -233,17 +233,18 @@ def render_ffmpeg_engine_settings(tr):
 
 def render_system_panel(tr):
     """渲染系统设置面板"""
+    st.caption("清理缓存与临时文件、选择 FFmpeg 引擎。清理任务目录会删除历史成片，请谨慎操作。")
     with st.expander(tr("System settings"), expanded=False):
         col1, col2, col3, col4 = st.columns(4)
-                
+
         with col1:
             if st.button(tr("Clear frames"), use_container_width=True):
                 clear_directory(os.path.join(storage_dir(), "temp/keyframes"), tr)
-                
+
         with col2:
             if st.button(tr("Clear clip videos"), use_container_width=True):
                 clear_directory(os.path.join(storage_dir(), "temp/clip_video"), tr)
-                
+
         with col3:
             if st.button(tr("Clear tasks"), use_container_width=True):
                 clear_directory(os.path.join(storage_dir(), "tasks"), tr)

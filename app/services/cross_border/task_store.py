@@ -215,10 +215,24 @@ def create_task(
     voice_pitch: float = 1.0,
     task_name: str = "",
     video_title: str = "",
+    mode: str = "subtitle",
+    bilingual: bool = False,
+    subtitle_font: str = "simhei.ttf",
+    subtitle_font_size: int = 0,
+    subtitle_position: str = "bottom",
+    subtitle_color: str = "#FFFFFF",
+    subtitle_style: str = "cinema",
+    subtitle_size_preset: str = "auto",
+    subtitle_position_key: str = "bottom",
+    subtitle_font_size_user_set: bool = False,
 ) -> Dict[str, Any]:
     direction = (direction or "inbound").lower()
     if direction not in {"inbound", "outbound"}:
         raise ValueError("direction must be inbound or outbound")
+
+    mode = (mode or "subtitle").strip().lower()
+    if mode not in {"subtitle", "narration"}:
+        mode = "subtitle"
 
     if direction == "inbound":
         source_lang = source_lang or "en"
@@ -264,6 +278,7 @@ def create_task(
         "task_id": task_id,
         "display_name": display_name,
         "direction": direction,
+        "mode": mode,
         "source_lang": source_lang,
         "target_lang": target_lang,
         "style_pack": pack["id"],
@@ -274,6 +289,8 @@ def create_task(
             "video_path": video_path,
             "video_title": title,
             "task_name": (task_name or "").strip(),
+            "mode": mode,
+            "bilingual": bool(bilingual),
             "glossary": normalize_glossary(glossary),
             "duration_mode": duration_mode,
             "original_audio_ratio": float(original_audio_ratio),
@@ -288,10 +305,24 @@ def create_task(
             "tts_engine": (tts_engine or "").strip(),
             "voice_rate": float(voice_rate or 1.0),
             "voice_pitch": float(voice_pitch or 1.0),
+            "subtitle_font": (subtitle_font or "simhei.ttf").strip() or "simhei.ttf",
+            "subtitle_font_size": int(subtitle_font_size or 0),
+            "subtitle_auto_style": True,
+            "subtitle_font_size_user_set": bool(subtitle_font_size_user_set),
+            "subtitle_position": (subtitle_position or "bottom").strip() or "bottom",
+            "subtitle_position_key": (subtitle_position_key or subtitle_position or "bottom")
+            .strip()
+            .lower()
+            or "bottom",
+            "subtitle_style": (subtitle_style or "cinema").strip().lower() or "cinema",
+            "subtitle_size_preset": (subtitle_size_preset or "auto").strip().lower()
+            or "auto",
+            "subtitle_color": (subtitle_color or "#FFFFFF").strip() or "#FFFFFF",
         },
         "artifacts": {
             "source_srt": "",
             "target_srt": "",
+            "burn_srt": "",
             "asr_backend": "",
             "digest": "",
             "narration_copy": "",
@@ -411,6 +442,9 @@ def list_tasks(limit: int = 50) -> List[Dict[str, Any]]:
                     "video_title": inputs.get("video_title")
                     or video_stem(inputs.get("video_path") or ""),
                     "direction": meta.get("direction"),
+                    "mode": meta.get("mode")
+                    or inputs.get("mode")
+                    or "subtitle",
                     "status": meta.get("status"),
                     "progress": meta.get("progress"),
                     "style_pack": meta.get("style_pack"),

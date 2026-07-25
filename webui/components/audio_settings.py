@@ -542,6 +542,7 @@ def render_audio_panel(tr):
     """渲染音频设置面板"""
     with st.container(border=True):
         st.write(tr("Audio Settings"))
+        st.caption("选好 TTS 引擎与音色即可。Edge TTS 免 Key，适合先试跑。")
 
         # 渲染TTS设置
         render_tts_settings(tr)

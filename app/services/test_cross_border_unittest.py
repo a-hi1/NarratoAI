@@ -64,9 +64,25 @@ class StateMachineTests(unittest.TestCase):
             state_machine.assert_transition("draft", "completed")
 
     def test_progress_and_next(self):
-        self.assertEqual(state_machine.progress_of("copy_done"), 55)
-        self.assertEqual(state_machine.next_running_after("copy_done"), "match_running")
-        self.assertEqual(state_machine.next_running_after("packaging_done"), "completed")
+        self.assertEqual(state_machine.progress_of("copy_done"), 60)
+        self.assertEqual(
+            state_machine.next_running_after("copy_done", mode="narration"),
+            "match_running",
+        )
+        self.assertEqual(
+            state_machine.next_running_after("packaging_done", mode="narration"),
+            "completed",
+        )
+        self.assertEqual(
+            state_machine.next_running_after("translate_done", mode="subtitle"),
+            "burn_running",
+        )
+        self.assertEqual(
+            state_machine.next_running_after("burn_done", mode="subtitle"),
+            "completed",
+        )
+        self.assertEqual(state_machine.steps_for_mode("subtitle"), ("asr", "translate", "burn"))
+        self.assertIn("burn", state_machine.ALL_PIPELINE_STEPS)
 
     def test_failed_retry(self):
         state_machine.assert_transition("failed", "digest_running")
@@ -263,10 +279,23 @@ class PromptRegistrationTests(unittest.TestCase):
 
 class AsrRoutingTests(unittest.TestCase):
     def test_backend_chain_language_bias(self):
-        zh_chain = asr_mod.backend_chain("auto", "zh")
-        en_chain = asr_mod.backend_chain("auto", "en")
-        self.assertEqual(zh_chain[0], "local")
-        self.assertEqual(en_chain[0], "firered")
+        # auto 默认优先内置 whisper（若可用），本地服务仅可达时插入
+        with mock.patch.object(asr_mod, "_whisper_available", return_value=True), mock.patch.object(
+            asr_mod, "_url_reachable", return_value=False
+        ), mock.patch.object(asr_mod, "_bailian_ready", return_value=False):
+            zh_chain = asr_mod.backend_chain("auto", "zh")
+            en_chain = asr_mod.backend_chain("auto", "en")
+            self.assertEqual(zh_chain[0], "whisper")
+            self.assertEqual(en_chain[0], "whisper")
+
+        with mock.patch.object(asr_mod, "_whisper_available", return_value=True), mock.patch.object(
+            asr_mod, "_url_reachable", return_value=True
+        ), mock.patch.object(asr_mod, "_bailian_ready", return_value=False):
+            zh_chain = asr_mod.backend_chain("auto", "zh")
+            # whisper 仍优先，local 在后
+            self.assertEqual(zh_chain[0], "whisper")
+            self.assertIn("local", zh_chain)
+
         self.assertEqual(asr_mod.backend_chain("bailian", "en")[0], "bailian")
         self.assertEqual(asr_mod.backend_chain("manual", "en"), [])
 
@@ -323,6 +352,21 @@ class AsrRoutingTests(unittest.TestCase):
             self.assertEqual(backend2, "placeholder")
             self.assertTrue(asr_mod.is_placeholder_srt(path2))
             self.assertTrue(any("failed" in x.lower() for x in logs2))
+
+    def test_write_segments_srt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.srt")
+            path = asr_mod._write_segments_srt(
+                out,
+                [
+                    {"start": 0.0, "end": 1.2, "text": " Hello "},
+                    {"start": 1.2, "end": 2.0, "text": "World"},
+                ],
+            )
+            text = open(path, encoding="utf-8").read()
+            self.assertIn("Hello", text)
+            self.assertIn("World", text)
+            self.assertIn("-->", text)
 
 
 class TranslateGlossaryPromptTests(unittest.TestCase):
@@ -413,6 +457,7 @@ class PipelineSkeletonTests(unittest.TestCase):
                     video_path=video_path,
                     style_pack="in_hook_narration",
                     glossary="Hello = 哈喽",
+                    mode="narration",
                 )
                 srt_path = task_store.artifact_path(meta["task_id"], "source.srt")
                 with open(srt_path, "w", encoding="utf-8") as f:
@@ -738,6 +783,148 @@ class RenderHelperTests(unittest.TestCase):
                 )
 
 
+class BurnSubtitleModeTests(unittest.TestCase):
+    def test_build_bilingual_srt(self):
+        from app.services.cross_border import burn as burn_mod
+
+        src = (
+            "1\n00:00:00,000 --> 00:00:02,000\nHello\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\nWorld\n"
+        )
+        tgt = (
+            "1\n00:00:00,000 --> 00:00:02,000\n你好\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\n世界\n"
+        )
+        merged = burn_mod.build_bilingual_srt(src, tgt, order="target_first")
+        self.assertIn("你好", merged)
+        self.assertIn("Hello", merged)
+        # 目标在前
+        hello_pos = merged.index("Hello")
+        nihao_pos = merged.index("你好")
+        self.assertLess(nihao_pos, hello_pos)
+
+    def test_adaptive_style_portrait(self):
+        from app.services.cross_border import burn as burn_mod
+
+        # 竖屏 608x1080：short/38 ≈ 16，夹在 14–26
+        style = burn_mod.adaptive_style(video_width=608, video_height=1080)
+        self.assertTrue(style["is_portrait"])
+        self.assertGreaterEqual(style["subtitle_font_size"], 14)
+        self.assertLessEqual(style["subtitle_font_size"], 22)
+        self.assertAlmostEqual(style["subtitle_font_size"], 16, delta=3)
+
+        # 横屏 1920x1080：h/48 ≈ 22.5，电影小字贴底
+        land = burn_mod.adaptive_style(video_width=1920, video_height=1080)
+        self.assertFalse(land["is_portrait"])
+        self.assertGreaterEqual(land["subtitle_font_size"], 18)
+        self.assertLessEqual(land["subtitle_font_size"], 26)
+        self.assertAlmostEqual(land["subtitle_font_size"], 22, delta=3)
+
+        style_bi = burn_mod.adaptive_style(
+            video_width=608, video_height=1080, bilingual=True
+        )
+        self.assertLessEqual(
+            style_bi["subtitle_font_size"], style["subtitle_font_size"]
+        )
+
+        # 默认 cinema；贴底 margin 小、左右有气口
+        self.assertEqual(land["style_key"], "cinema")
+        self.assertGreaterEqual(land["margin_v"], 10)
+        self.assertLessEqual(land["margin_v"], 40)
+        self.assertGreaterEqual(land["margin_lr"], 24)
+        self.assertLessEqual(land["stroke_width"], 1.2)
+
+        opts = burn_mod.resolve_burn_options(
+            {
+                "subtitle_font": "simhei.ttf",
+                "subtitle_font_size": 0,
+                "subtitle_style": "cinema",
+                "subtitle_position_key": "bottom",
+            },
+            video_path="",
+        )
+        self.assertIn("subtitle_font_size", opts)
+        self.assertGreater(opts["subtitle_font_size"], 0)
+        self.assertLessEqual(opts["subtitle_font_size"], 26)
+        self.assertEqual(opts["subtitle_position"], "bottom")
+        self.assertIn("ass_margin_v", opts)
+        self.assertGreater(opts["ass_margin_v"], 0)
+        self.assertIn("ass_margin_lr", opts)
+        # 旧默认 48/64 且未手动设定 → 走自适应
+        opts_legacy = burn_mod.resolve_burn_options(
+            {"subtitle_font_size": 48, "subtitle_font_size_user_set": False},
+            video_path="",
+        )
+        self.assertNotEqual(opts_legacy["subtitle_font_size"], 48)
+        self.assertLessEqual(opts_legacy["subtitle_font_size"], 32)
+
+    def test_subtitle_mode_pipeline_to_burn(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        sample_srt = (
+            "1\n00:00:00,000 --> 00:00:03,000\nHello world\n\n"
+            "2\n00:00:03,000 --> 00:00:06,000\nSecond line\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "demo.mp4")
+            with open(video_path, "wb") as f:
+                f.write(b"\x00\x00")
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="inbound",
+                    video_path=video_path,
+                    mode="subtitle",
+                    bilingual=True,
+                )
+                self.assertEqual(meta.get("mode"), "subtitle")
+                srt_path = task_store.artifact_path(meta["task_id"], "source.srt")
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(sample_srt)
+                meta["artifacts"]["source_srt"] = srt_path
+                task_store.save_meta(meta)
+
+                def fake_burn(m):
+                    m = task_store.transition(m, "burn_running")
+                    out = os.path.join(
+                        task_store.artifact_path(m["task_id"], "export"), "output.mp4"
+                    )
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    with open(out, "wb") as f:
+                        f.write(b"\x00" * 2048)
+                    m["artifacts"]["output_mp4"] = out
+                    m["artifacts"]["burn_srt"] = task_store.artifact_path(
+                        m["task_id"], "burn.srt"
+                    )
+                    task_store.write_text_artifact(
+                        m["task_id"], "burn.srt", "1\n00:00:00,000 --> 00:00:01,000\n你好\n"
+                    )
+                    task_store.save_meta(m)
+                    m = task_store.transition(m, "burn_done")
+                    return task_store.transition(m, "completed")
+
+                with mock.patch.object(
+                    cb_pipeline, "step_translate", side_effect=lambda m: _fake_translate(m, sample_srt)
+                ), mock.patch.object(cb_pipeline, "step_burn", side_effect=fake_burn):
+                    result = cb_pipeline.run_from(
+                        task_store.load_meta(meta["task_id"]),
+                        start_step="asr",
+                        stop_after=None,
+                    )
+
+                self.assertEqual(
+                    result["status"],
+                    "completed",
+                    msg=f"error={result.get('error')} logs={result.get('logs')[-5:]}",
+                )
+                self.assertTrue(
+                    os.path.isfile(result["artifacts"].get("output_mp4") or "")
+                )
+                # 字幕模式不应生成 digest/script
+                self.assertFalse(
+                    os.path.isfile(task_store.artifact_path(meta["task_id"], "digest.md"))
+                )
+
+
 def _fake_translate(meta, sample_srt):
     from app.services.cross_border.task_store import (
         save_meta,
@@ -764,6 +951,86 @@ def _fake_pass(meta, step):
         meta["artifacts"]["output_mp4"] = meta["inputs"].get("video_path") or ""
     save_meta(meta)
     return transition(meta, f"{step}_done")
+
+
+
+class UrlDownloadHelperTests(unittest.TestCase):
+    def test_is_http_url_and_title(self):
+        from app.services.cross_border import url_download as ud
+
+        self.assertTrue(ud.is_http_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+        self.assertTrue(ud.is_http_url("http://example.com/a.mp4"))
+        self.assertFalse(ud.is_http_url(""))
+        self.assertFalse(ud.is_http_url("ftp://x"))
+        self.assertFalse(ud.is_http_url("not a url"))
+        self.assertEqual(ud.sanitize_title("Hello:World/Test"), "Hello World Test")
+        self.assertEqual(ud.sanitize_title(""), "downloaded_video")
+
+    def test_format_selector_contains_height(self):
+        from app.services.cross_border import url_download as ud
+
+        sel = ud._format_selector(720)
+        self.assertIn("height<=720", sel)
+        self.assertIn("mp4", sel)
+
+    def test_download_invalid_url_and_missing_ytdlp(self):
+        from app.services.cross_border import url_download as ud
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "source.mp4")
+            with self.assertRaises(ud.UrlDownloadError):
+                ud.download_url_to_file("not-a-url", out)
+            with mock.patch.object(ud, "yt_dlp_available", return_value=False):
+                with self.assertRaises(ud.UrlDownloadError) as ctx:
+                    ud.download_url_to_file("https://example.com/v", out)
+                self.assertIn("yt-dlp", str(ctx.exception).lower())
+
+    def test_download_success_with_mocked_ytdlp(self):
+        import sys
+        import types
+        from app.services.cross_border import url_download as ud
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "source.mp4")
+            # download_url_to_file creates work_dir under out's parent
+            work_dir = os.path.join(tmp, "_url_dl")
+
+            class FakeYDL:
+                def __init__(self, opts):
+                    self.opts = opts
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def extract_info(self, url, download=True):
+                    os.makedirs(work_dir, exist_ok=True)
+                    media = os.path.join(work_dir, "media.mp4")
+                    with open(media, "wb") as f:
+                        f.write(b"\x00" * 4096)
+                    return {
+                        "title": "Demo: Title/OK",
+                        "webpage_url": url,
+                        "extractor": "fake",
+                        "requested_downloads": [{"filepath": media}],
+                    }
+
+            fake_mod = types.SimpleNamespace(YoutubeDL=FakeYDL)
+            with mock.patch.dict(sys.modules, {"yt_dlp": fake_mod}), mock.patch.object(
+                ud, "yt_dlp_available", return_value=True
+            ), mock.patch.object(ud, "_probe_video_codec", return_value="h264"):
+                result = ud.download_url_to_file(
+                    "https://example.com/watch?v=1",
+                    out,
+                    prefer_h264=True,
+                )
+            self.assertTrue(os.path.isfile(result["path"]))
+            self.assertEqual(result["title"], "Demo Title OK")
+            self.assertFalse(result["transcoded"])
+            self.assertEqual(result["extractor"], "fake")
+
 
 
 if __name__ == "__main__":

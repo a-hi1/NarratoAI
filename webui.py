@@ -7,6 +7,7 @@ from loguru import logger
 from app.config import config
 from webui.components import basic_settings, video_settings, audio_settings, subtitle_settings, script_settings, \
     system_settings, cross_border_panel
+from webui import styles as ui_styles
 # from webui.utils import cache, file_utils
 from app.utils import utils
 from app.utils import ffmpeg_utils
@@ -23,7 +24,7 @@ st.set_page_config(
     menu_items={
         "Report a bug": "https://github.com/linyqh/NarratoAI/issues",
         "About": (
-            f"# NarratoAI 影视解说工坊 📽️\n"
+            f"# NarratoAI 影视解说工坊\n"
             f"#### 版本: v{config.project_version}\n"
             f"一站式 AI 影视解说 · 短剧混剪 · 跨境本地化\n\n"
             f"项目主页：https://github.com/linyqh/NarratoAI"
@@ -31,97 +32,8 @@ st.set_page_config(
     },
 )
 
-# 页面样式：收紧顶距 + 工作流卡片 + 操作区
-APP_CUSTOM_CSS = """
-<style>
-/* 主区域内边距 */
-#root > div:nth-child(1) > div > div > div > div > section > div {
-    padding-top: 1.2rem;
-    padding-bottom: 2.5rem;
-    padding-left: 1.5rem;
-    padding-right: 1.5rem;
-}
-/* 顶部标题区 */
-.narrato-hero {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 0.75rem 1.5rem;
-    margin: 0 0 1rem 0;
-    padding: 0.85rem 1.1rem;
-    border: 1px solid rgba(49, 51, 63, 0.12);
-    border-radius: 12px;
-    background: linear-gradient(135deg, rgba(255,75,75,0.08), rgba(49,130,246,0.06) 55%, rgba(255,255,255,0.9));
-}
-.narrato-hero-title {
-    font-size: 1.55rem;
-    font-weight: 750;
-    color: #1f2430;
-    line-height: 1.3;
-    margin: 0;
-}
-.narrato-hero-title span {
-    color: #ff4b4b;
-}
-.narrato-hero-sub {
-    margin: 0.25rem 0 0 0;
-    color: #5f6575;
-    font-size: 0.92rem;
-    line-height: 1.45;
-}
-.narrato-hero-meta {
-    color: #7a8192;
-    font-size: 0.82rem;
-    white-space: nowrap;
-}
-/* 工作流引导条 */
-.narrato-guide {
-    margin: 0 0 0.85rem 0;
-    padding: 0.65rem 0.9rem;
-    border-left: 4px solid #ff4b4b;
-    border-radius: 0 8px 8px 0;
-    background: rgba(255, 75, 75, 0.06);
-    color: #3a3f4b;
-    font-size: 0.92rem;
-    line-height: 1.5;
-}
-/* 分栏小标题 */
-.narrato-col-title {
-    font-size: 0.95rem;
-    font-weight: 700;
-    color: #323846;
-    margin: 0 0 0.4rem 0;
-    padding-bottom: 0.3rem;
-    border-bottom: 1px solid rgba(49, 51, 63, 0.1);
-}
-/* 底部操作区 */
-.narrato-action-bar {
-    margin-top: 1rem;
-    padding: 0.9rem 1rem 0.4rem;
-    border: 1px solid rgba(49, 51, 63, 0.12);
-    border-radius: 12px;
-    background: #fafbfd;
-}
-.narrato-action-title {
-    font-size: 1.05rem;
-    font-weight: 700;
-    color: #202534;
-    margin: 0 0 0.2rem 0;
-}
-.narrato-action-hint {
-    color: #6b7280;
-    font-size: 0.88rem;
-    margin: 0 0 0.75rem 0;
-    line-height: 1.45;
-}
-/* Tab 标签更醒目 */
-button[data-baseweb="tab"] {
-    font-weight: 600 !important;
-}
-</style>
-"""
-st.markdown(APP_CUSTOM_CSS, unsafe_allow_html=True)
+# 整站设计系统：扁平浅色、专业工具风（见 webui/styles.py + .streamlit/config.toml）
+ui_styles.inject_global_css()
 
 
 def init_log():
@@ -261,7 +173,11 @@ def _render_generation_status(task: dict | None) -> str:
     ffmpeg_percent = _format_optional_percent(task.get("ffmpeg_progress"))
 
     if current_step <= 0:
-        return f"<div style='font-weight:650;color:#262730;'>{escape(message or '正在生成视频，请稍候...')}</div>"
+        return (
+            f'<div class="narrato-gen-step current">'
+            f"{escape(message or '正在生成视频，请稍候...')}"
+            f"</div>"
+        )
 
     lines = []
     for index, default_label in enumerate(VIDEO_GENERATION_STEP_LABELS, start=1):
@@ -279,18 +195,16 @@ def _render_generation_status(task: dict | None) -> str:
         ):
             suffix = f"{suffix}，ffmpeg {ffmpeg_percent}%"
 
-        color = "#262730" if is_current else "#8b9099" if is_done else "#b9bec7"
-        weight = "650" if is_current else "500"
+        if is_current:
+            cls = "current"
+        elif is_done:
+            cls = "done"
+        else:
+            cls = "todo"
         lines.append(
-            "<div style='"
-            "font-size:1.02rem;"
-            "line-height:1.85;"
-            "margin:0.28rem 0;"
-            f"color:{color};"
-            f"font-weight:{weight};"
-            "'>"
+            f'<div class="narrato-gen-step {cls}">'
             f"{escape(label)} <span style='white-space:nowrap;'>({escape(suffix)})</span>"
-            "</div>"
+            f"</div>"
         )
 
     return "".join(lines)
@@ -747,19 +661,13 @@ def render_export_jianying_button():
 
 def _render_app_header():
     """中文优先的顶部标题区。"""
-    version = escape(str(config.project_version or ""))
-    title = escape(tr("App Title"))
-    subtitle = escape(tr("App Subtitle"))
     st.markdown(
-        f"""
-        <div class="narrato-hero">
-            <div>
-                <div class="narrato-hero-title">📽️ {title.replace("NarratoAI", "Narrato<span>AI</span>", 1)}</div>
-                <p class="narrato-hero-sub">{subtitle}</p>
-            </div>
-            <div class="narrato-hero-meta">v{version}</div>
-        </div>
-        """,
+        ui_styles.hero_html(
+            title=tr("App Title"),
+            subtitle=tr("App Subtitle"),
+            version=str(config.project_version or ""),
+            chips=["影视解说", "短剧混剪", "跨境本地化"],
+        ),
         unsafe_allow_html=True,
     )
     with st.expander(tr("About and Help"), expanded=False):
@@ -769,38 +677,39 @@ def _render_app_header():
 def _render_narration_workspace():
     """影视 / 短剧解说工作台：脚本 · 配音 · 画面字幕 + 成片操作。"""
     st.markdown(
-        f'<div class="narrato-guide">{escape(tr("Workflow Guide Narration"))}</div>',
+        ui_styles.guide_html(
+            f"<strong>三步成片</strong>：左侧准备脚本 → 中间选配音 → 右侧设画面与字幕 → 底部一键生成。"
+            f"<br/>{escape(tr('Workflow Guide Narration'))}"
+        ),
         unsafe_allow_html=True,
     )
 
     panel = st.columns([1.15, 1, 1])
     with panel[0]:
         st.markdown(
-            f'<div class="narrato-col-title">{escape(tr("Script Column Panel"))}</div>',
+            ui_styles.col_title_html(tr("Script Column Panel")),
             unsafe_allow_html=True,
         )
         script_settings.render_script_panel(tr)
     with panel[1]:
         st.markdown(
-            f'<div class="narrato-col-title">{escape(tr("Audio Column Panel"))}</div>',
+            ui_styles.col_title_html(tr("Audio Column Panel")),
             unsafe_allow_html=True,
         )
         audio_settings.render_audio_panel(tr)
     with panel[2]:
         st.markdown(
-            f'<div class="narrato-col-title">{escape(tr("Video Column Panel"))}</div>',
+            ui_styles.col_title_html(tr("Video Column Panel")),
             unsafe_allow_html=True,
         )
         video_settings.render_video_panel(tr)
         subtitle_settings.render_subtitle_panel(tr)
 
     st.markdown(
-        f"""
-        <div class="narrato-action-bar">
-            <div class="narrato-action-title">{escape(tr("Action Bar Title"))}</div>
-            <div class="narrato-action-hint">{escape(tr("Action Bar Hint"))}</div>
-        </div>
-        """,
+        ui_styles.action_bar_html(
+            tr("Action Bar Title"),
+            tr("Action Bar Hint"),
+        ),
         unsafe_allow_html=True,
     )
     action_cols = st.columns([1, 1, 0.4])
@@ -821,9 +730,9 @@ def main():
             from app.services.llm.providers import register_all_providers
             register_all_providers()
             st.session_state['llm_providers_registered'] = True
-            logger.info("✅ LLM 提供商注册成功")
+            logger.info("LLM 提供商注册成功")
         except Exception as e:
-            logger.error(f"❌ LLM 提供商注册失败: {str(e)}")
+            logger.error(f"LLM 提供商注册失败: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             st.error(tr("LLM initialization failed").format(error=str(e)))
@@ -863,17 +772,26 @@ def main():
 
     with tab_cross_border:
         st.markdown(
-            f'<div class="narrato-guide">{escape(tr("Workflow Guide Cross Border"))}</div>',
+            ui_styles.guide_html(
+                f"<strong>最快路径</strong>：上传视频 → 自动识别台词 → 翻译 → 烧字幕成片。"
+                f"<br/>{escape(tr('Workflow Guide Cross Border'))}"
+            ),
             unsafe_allow_html=True,
         )
         # 独立 Tab，不再沉在页面底部
         cross_border_panel.render_cross_border_panel(tr)
 
     with tab_settings:
+        st.markdown(
+            ui_styles.guide_html(
+                "<strong>基础与系统</strong>：模型 / 语言 / 代理 / 缓存。日常成片不改也能跑；"
+                "配 API Key 后解说与翻译更稳。"
+            ),
+            unsafe_allow_html=True,
+        )
         basic_settings.render_basic_settings(tr)
-        # 系统设置也放在设置 Tab，避免与解说工作台重复拥挤
-        with st.expander(tr("System settings"), expanded=False):
-            system_settings.render_system_panel(tr)
+        # 系统设置自带 expander，避免与解说工作台重复拥挤
+        system_settings.render_system_panel(tr)
 
 
 if __name__ == "__main__":

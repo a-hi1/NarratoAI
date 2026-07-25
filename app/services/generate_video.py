@@ -342,7 +342,11 @@ def _quote_filter_value(value: str) -> str:
     return f"'{escaped}'"
 
 
-def _probe_video(video_path: str) -> Dict[str, Any]:
+def _run_ffprobe_json(video_path: str) -> Dict[str, Any]:
+    """
+    跑 ffprobe。Windows 下 text=True 默认 gbk 会炸中文路径/二进制输出，
+    统一按 bytes 读再 utf-8 解码。
+    """
     ffmpeg_binary = _get_ffmpeg_binary()
     ffprobe_binary = _get_ffprobe_binary(ffmpeg_binary)
     cmd = [
@@ -359,17 +363,25 @@ def _probe_video(video_path: str) -> Dict[str, Any]:
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         check=False,
     )
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
     if result.returncode != 0:
-        raise RuntimeError(f"ffprobe 读取视频失败: {result.stderr.strip()}")
+        raise RuntimeError(f"ffprobe 读取视频失败: {stderr.strip()}")
+    return json.loads(stdout or "{}")
 
-    data = json.loads(result.stdout or "{}")
+
+def _probe_video(video_path: str) -> Dict[str, Any]:
+    data = _run_ffprobe_json(video_path)
     streams = data.get("streams", [])
     video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
     if not video_stream:
-        raise RuntimeError("ffprobe 未找到视频流")
+        # 中文路径偶发：改用 ffmpeg -i 兜底解析宽高时长
+        try:
+            return _probe_video_via_ffmpeg(video_path)
+        except Exception:
+            raise RuntimeError("ffprobe 未找到视频流")
 
     duration = (
         video_stream.get("duration")
@@ -385,6 +397,36 @@ def _probe_video(video_path: str) -> Dict[str, Any]:
         "height": int(video_stream["height"]),
         "duration": duration,
         "has_audio": any(stream.get("codec_type") == "audio" for stream in streams),
+    }
+
+
+def _probe_video_via_ffmpeg(video_path: str) -> Dict[str, Any]:
+    """ffprobe 异常时用 ffmpeg -i 解析（兼容中文路径）。"""
+    import re
+
+    ffmpeg_binary = _get_ffmpeg_binary()
+    result = subprocess.run(
+        [ffmpeg_binary, "-hide_banner", "-i", video_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    text = (result.stderr or b"").decode("utf-8", errors="replace")
+    # Stream #0:0: Video: ..., 1920x1080
+    m = re.search(r"Video:.*?\s(\d{2,5})x(\d{2,5})", text)
+    if not m:
+        raise RuntimeError("ffmpeg -i 未找到视频流")
+    width, height = int(m.group(1)), int(m.group(2))
+    dm = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if not dm:
+        raise RuntimeError("ffmpeg -i 未获取到时长")
+    duration = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3))
+    has_audio = "Audio:" in text
+    return {
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "has_audio": has_audio,
     }
 
 
@@ -701,7 +743,14 @@ def _estimate_subtitle_margin(
     subtitle_position: str,
     custom_position: float,
     orientation_subtitle_y_percent: Optional[float],
+    *,
+    ass_margin_v: Optional[int] = None,
+    ass_alignment: Optional[int] = None,
 ) -> tuple[int, int]:
+    # 跨境硬烧可直接指定 ASS MarginV / Alignment（更准）
+    if ass_alignment is not None and ass_margin_v is not None:
+        return int(ass_alignment), max(10, int(ass_margin_v))
+
     if subtitle_position == "top":
         return 8, max(10, round(video_height * 0.05))
     if subtitle_position == "center":
@@ -717,7 +766,21 @@ def _estimate_subtitle_margin(
         margin = video_height - y - estimated_text_height
         return 2, max(10, round(margin))
 
-    return 2, max(10, round(video_height * 0.05))
+    # bottom 默认：优先用显式 margin_v，否则约 5.5% 屏高
+    if ass_margin_v is not None:
+        return 2, max(10, int(ass_margin_v))
+    return 2, max(10, round(video_height * 0.055))
+
+
+def _ffmpeg_path_for_filter(path: str) -> str:
+    """
+    ffmpeg 滤镜里的路径：正斜杠 + 盘符冒号转义。
+    例 D:\\a\\b.srt → D\\:/a/b.srt
+    """
+    p = os.path.abspath(path or "").replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        p = p[0] + "\\:" + p[2:]
+    return p
 
 
 def _build_subtitle_filter(
@@ -733,6 +796,13 @@ def _build_subtitle_filter(
     subtitle_position: str,
     custom_position: float,
     orientation_subtitle_y_percent: Optional[float],
+    *,
+    ass_margin_v: Optional[int] = None,
+    ass_alignment: Optional[int] = None,
+    ass_border_style: int = 1,
+    ass_shadow: int = 0,
+    ass_back_colour: Optional[str] = None,
+    ass_margin_lr: Optional[int] = None,
 ) -> str:
     font_family = _resolve_font_family(font_path, subtitle_font)
     alignment, margin_v = _estimate_subtitle_margin(
@@ -741,25 +811,44 @@ def _build_subtitle_filter(
         subtitle_position=subtitle_position,
         custom_position=custom_position,
         orientation_subtitle_y_percent=orientation_subtitle_y_percent,
+        ass_margin_v=ass_margin_v,
+        ass_alignment=ass_alignment,
     )
-    force_style = ",".join(
-        [
-            f"Fontname={font_family}",
-            f"Fontsize={subtitle_font_size}",
-            f"PrimaryColour={_css_color_to_ass(subtitle_color, '#FFFFFF')}",
-            f"OutlineColour={_css_color_to_ass(stroke_color, '#000000')}",
-            "BorderStyle=1",
-            f"Outline={stroke_width}",
-            "Shadow=0",
-            f"Alignment={alignment}",
-            f"MarginV={margin_v}",
-        ]
-    )
+    try:
+        margin_lr = int(ass_margin_lr) if ass_margin_lr is not None else 40
+    except (TypeError, ValueError):
+        margin_lr = 40
+    margin_lr = max(16, min(120, margin_lr))
+    style_parts = [
+        f"Fontname={font_family}",
+        f"Fontsize={subtitle_font_size}",
+        f"PrimaryColour={_css_color_to_ass(subtitle_color, '#FFFFFF')}",
+        f"OutlineColour={_css_color_to_ass(stroke_color, '#000000')}",
+        f"BorderStyle={int(ass_border_style or 1)}",
+        f"Outline={stroke_width}",
+        f"Shadow={int(ass_shadow or 0)}",
+        f"Alignment={alignment}",
+        f"MarginV={margin_v}",
+        f"MarginL={margin_lr}",
+        f"MarginR={margin_lr}",
+    ]
+    # 半透明底框：ASS BackColour（&HAABBGGRR 或 #RRGGBB）
+    if ass_back_colour:
+        back = str(ass_back_colour).strip()
+        if back.startswith("&H") or back.startswith("&h"):
+            style_parts.append(f"BackColour={back}")
+        else:
+            style_parts.append(f"BackColour={_css_color_to_ass(back, '#000000')}")
 
-    args = [f"filename={_quote_filter_value(subtitle_path)}"]
+    force_style = ",".join(style_parts)
+
+    # filename 用滤镜路径转义；不要再包一层会拆坏盘符的 quote
+    sub_path = _ffmpeg_path_for_filter(subtitle_path)
+    args = [f"filename='{sub_path}'"]
     args.append(f"original_size={video_width}x{video_height}")
     if font_path:
-        args.append(f"fontsdir={_quote_filter_value(os.path.dirname(font_path))}")
+        fonts_dir = _ffmpeg_path_for_filter(os.path.dirname(font_path))
+        args.append(f"fontsdir='{fonts_dir}'")
     args.append(f"force_style={_quote_filter_value(force_style)}")
     return f"subtitles={':'.join(args)}"
 
@@ -1011,15 +1100,27 @@ def _build_video_encoder_args(encoder: str, threads: int) -> list[str]:
 
     args = ["-c:v", encoder]
     if encoder == "h264_nvenc":
-        args.extend(["-preset", "fast", "-cq", "23"])
+        args.extend(["-preset", "fast", "-cq", "23", "-pix_fmt", "yuv420p"])
     elif encoder == "h264_videotoolbox":
-        args.extend(["-q:v", "65"])
+        args.extend(["-q:v", "65", "-pix_fmt", "yuv420p"])
     elif encoder == "h264_qsv":
-        args.extend(["-preset", "veryfast", "-global_quality", "23"])
+        # QSV + 滤镜链/部分 ffmpeg 构建易出坏 NAL；仍保留但强制像素格式
+        args.extend(["-preset", "veryfast", "-global_quality", "23", "-pix_fmt", "yuv420p"])
     elif encoder == "h264_amf":
-        args.extend(["-quality", "speed", "-qp_i", "23", "-qp_p", "23"])
+        args.extend(["-quality", "speed", "-qp_i", "23", "-qp_p", "23", "-pix_fmt", "yuv420p"])
     else:
-        args.extend(["-preset", "veryfast", "-crf", "23", "-threads", str(threads)])
+        args.extend(
+            [
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-threads",
+                str(max(1, int(threads or 2))),
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
     return args
 
 
@@ -1070,6 +1171,25 @@ def _build_ffmpeg_merge_command(
     custom_position = float(options.get("custom_position", 70))
     stroke_color = options.get("stroke_color", "#000000")
     stroke_width = options.get("stroke_width", 1)
+    # 跨境硬烧透传的 ASS 样式（可选）
+    ass_margin_v = options.get("ass_margin_v")
+    ass_alignment = options.get("ass_alignment")
+    ass_border_style = int(options.get("ass_border_style") or 1)
+    ass_shadow = int(options.get("ass_shadow") or 0)
+    ass_back_colour = options.get("ass_back_colour")
+    ass_margin_lr = options.get("ass_margin_lr")
+    try:
+        ass_margin_v = int(ass_margin_v) if ass_margin_v is not None else None
+    except (TypeError, ValueError):
+        ass_margin_v = None
+    try:
+        ass_alignment = int(ass_alignment) if ass_alignment is not None else None
+    except (TypeError, ValueError):
+        ass_alignment = None
+    try:
+        ass_margin_lr = int(ass_margin_lr) if ass_margin_lr is not None else None
+    except (TypeError, ValueError):
+        ass_margin_lr = None
     threads = int(options.get("threads", 2))
     fps = options.get("fps", 30)
     subtitle_enabled = options.get("subtitle_enabled", True)
@@ -1170,24 +1290,9 @@ def _build_ffmpeg_merge_command(
             video_height,
             options,
         )
-        if has_drawtext_filter:
-            drawtext_filters = _build_drawtext_filters(
-                subtitle_path=subtitle_path,
-                font_path=font_path,
-                subtitle_font_size=subtitle_font_size,
-                subtitle_color=subtitle_color,
-                stroke_color=stroke_color,
-                stroke_width=stroke_width,
-                subtitle_position=subtitle_position,
-                custom_position=custom_position,
-                orientation_subtitle_y_percent=orientation_subtitle_y_percent,
-                video_width=video_width,
-            )
-            for index, drawtext_filter in enumerate(drawtext_filters):
-                next_label = f"[v_drawtext_{index}]"
-                video_filters.append(f"{current_video_label}{drawtext_filter}{next_label}")
-                current_video_label = next_label
-        elif has_subtitles_filter:
+        # 优先 subtitles 滤镜：整份 SRT 一条滤镜，命令行短。
+        # drawtext 每条字幕一条滤镜，几百条会触发 Windows WinError 206（命令行过长）。
+        if has_subtitles_filter:
             subtitle_filter = _build_subtitle_filter(
                 subtitle_path=subtitle_path,
                 font_path=font_path,
@@ -1201,9 +1306,38 @@ def _build_ffmpeg_merge_command(
                 subtitle_position=subtitle_position,
                 custom_position=custom_position,
                 orientation_subtitle_y_percent=orientation_subtitle_y_percent,
+                ass_margin_v=ass_margin_v,
+                ass_alignment=ass_alignment,
+                ass_border_style=ass_border_style,
+                ass_shadow=ass_shadow,
+                ass_back_colour=ass_back_colour,
+                ass_margin_lr=ass_margin_lr,
             )
             video_filters.append(f"{current_video_label}{subtitle_filter}[v_subtitled]")
             current_video_label = "[v_subtitled]"
+        elif has_drawtext_filter:
+            drawtext_filters = _build_drawtext_filters(
+                subtitle_path=subtitle_path,
+                font_path=font_path,
+                subtitle_font_size=subtitle_font_size,
+                subtitle_color=subtitle_color,
+                stroke_color=stroke_color,
+                stroke_width=stroke_width,
+                subtitle_position=subtitle_position,
+                custom_position=custom_position,
+                orientation_subtitle_y_percent=orientation_subtitle_y_percent,
+                video_width=video_width,
+            )
+            # 防御：条数过多时不要拼超长命令
+            if len(drawtext_filters) > 80:
+                raise RuntimeError(
+                    f"drawtext 字幕条数过多({len(drawtext_filters)})，"
+                    "请使用带 libass/subtitles 滤镜的 ffmpeg"
+                )
+            for index, drawtext_filter in enumerate(drawtext_filters):
+                next_label = f"[v_drawtext_{index}]"
+                video_filters.append(f"{current_video_label}{drawtext_filter}{next_label}")
+                current_video_label = next_label
         else:
             y_expr = _resolve_overlay_y_expression(
                 subtitle_position=subtitle_position,
@@ -1265,7 +1399,12 @@ def _build_ffmpeg_merge_command(
         cmd.extend(["-filter_complex", ";".join(filter_parts)])
 
     if has_video_filter:
-        encoder = _select_compatible_encoder(ffmpeg_utils.get_optimal_ffmpeg_encoder())
+        preferred = str(options.get("video_encoder") or "").strip()
+        if preferred:
+            encoder = _select_compatible_encoder(preferred)
+        else:
+            encoder = _select_compatible_encoder(ffmpeg_utils.get_optimal_ffmpeg_encoder())
+        logger.info(f"ffmpeg video encoder: {encoder}")
         cmd.extend(["-map", "[vout]", *_build_video_encoder_args(encoder, threads)])
     else:
         cmd.extend(["-map", "0:v:0", "-c:v", "copy"])

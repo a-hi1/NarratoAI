@@ -267,7 +267,8 @@ def save_llm_generation_settings(model_prefix: str, params: dict) -> bool:
 
 def render_basic_settings(tr):
     """渲染基础设置面板"""
-    with st.expander(tr("Basic Settings"), expanded=False):
+    st.caption("配置界面语言、代理与 LLM。日常成片可保持默认；翻译/解说需要可用的文案模型。")
+    with st.expander(tr("Basic Settings"), expanded=True):
         config_panels = st.columns(3)
         left_config_panel = config_panels[0]
         middle_config_panel = config_panels[1]

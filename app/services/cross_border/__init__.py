@@ -2,10 +2,14 @@
 # -*- coding: UTF-8 -*-
 
 """
-跨境本地化解说服务（en↔zh 双向 MVP 骨架）
+跨境本地化服务（en↔zh 双向）
+
+默认模式 subtitle：仿 VideoLingo，ASR → 翻译 → 硬烧字幕。
+可选模式 narration：解说文案工厂（digest/copy/match/TTS/render）。
 """
 
 from . import asr
+from . import burn
 from . import compliance
 from . import glossary
 from . import packaging
@@ -17,6 +21,7 @@ from . import task_store
 
 __all__ = [
     "asr",
+    "burn",
     "compliance",
     "glossary",
     "packaging",

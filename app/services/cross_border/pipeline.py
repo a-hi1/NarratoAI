@@ -30,6 +30,7 @@ from app.services.prompts import PromptManager
 from app.services.subtitle_text import read_subtitle_text
 
 from . import asr as asr_mod
+from . import burn as burn_mod
 from . import packaging as packaging_mod
 from .glossary import (
     apply_locked_terms,
@@ -38,8 +39,7 @@ from .glossary import (
 )
 from .state_machine import (
     InvalidTransitionError,
-    PIPELINE_STEPS,
-    next_running_after,
+    steps_for_mode,
 )
 from .style_packs import resolve_style_pack
 from .task_store import (
@@ -247,6 +247,12 @@ def step_asr(meta: Dict[str, Any]) -> Dict[str, Any]:
             return transition(meta, "asr_done")
 
     preferred = asr_mod.resolve_asr_backend(meta)
+    append_log(
+        meta,
+        f"ASR start backend={preferred} video={os.path.basename(video_path or '')} "
+        f"size={os.path.getsize(video_path) if video_path and os.path.isfile(video_path) else 0}",
+    )
+    save_meta(meta)
     out_path, used_backend, attempt_logs = asr_mod.run_asr(
         video_path=video_path,
         subtitle_file=source_srt,
@@ -1057,6 +1063,77 @@ def step_packaging(meta: Dict[str, Any]) -> Dict[str, Any]:
     return transition(meta, "completed")
 
 
+def step_burn(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    VideoLingo 风格：原片 + 目标字幕 → 硬烧成片（保留原声）。
+    可选双语：目标在上 / 源在下。
+    """
+    meta = transition(meta, "burn_running")
+    task_id = meta["task_id"]
+    inputs = meta.get("inputs") or {}
+    artifacts = meta.setdefault("artifacts", {})
+    video_path = inputs.get("video_path") or ""
+    target_srt = artifacts.get("target_srt") or artifact_path(task_id, "target.srt")
+    source_srt = artifacts.get("source_srt") or artifact_path(task_id, "source.srt")
+
+    if not video_path or not os.path.isfile(video_path):
+        return _set_failed(meta, "video missing before burn", step="burn")
+    if not os.path.isfile(target_srt) or os.path.getsize(target_srt) < 5:
+        return _set_failed(meta, "target.srt missing/empty before burn", step="burn")
+
+    bilingual = bool(inputs.get("bilingual"))
+    burn_srt_path = artifact_path(task_id, "burn.srt")
+    if bilingual and os.path.isfile(source_srt):
+        src_text = read_text_artifact(source_srt)
+        tgt_text = read_text_artifact(target_srt)
+        merged = burn_mod.build_bilingual_srt(src_text, tgt_text, order="target_first")
+        if not merged.strip():
+            # 合并失败则退回单语目标字幕
+            merged = tgt_text
+            append_log(meta, "bilingual merge empty, fallback to target.srt", level="WARNING")
+        write_text_artifact(task_id, "burn.srt", merged)
+        append_log(meta, "built bilingual burn.srt (target over source)")
+    else:
+        # 单语：直接用目标字幕
+        tgt_text = read_text_artifact(target_srt)
+        write_text_artifact(task_id, "burn.srt", tgt_text if tgt_text.endswith("\n") else tgt_text + "\n")
+        append_log(meta, "using target.srt for burn")
+
+    artifacts["burn_srt"] = burn_srt_path
+    export_dir = artifact_path(task_id, "export")
+    os.makedirs(export_dir, exist_ok=True)
+    output_mp4 = os.path.join(export_dir, "output.mp4")
+
+    try:
+        burn_mod.burn_subtitles_to_video(
+            video_path=video_path,
+            subtitle_path=burn_srt_path,
+            output_path=output_mp4,
+            options=inputs,
+        )
+    except Exception as exc:
+        logger.exception("burn failed")
+        return _set_failed(meta, f"burn failed: {exc}", step="burn")
+
+    if not os.path.isfile(output_mp4) or os.path.getsize(output_mp4) < 1000:
+        return _set_failed(meta, "burn produced empty output.mp4", step="burn")
+
+    artifacts["output_mp4"] = output_mp4
+    artifacts["export_dir"] = export_dir
+    # 同步一份字幕到 export 方便下载
+    try:
+        export_srt = os.path.join(export_dir, "subtitle.srt")
+        shutil.copy2(burn_srt_path, export_srt)
+        artifacts["export_srt"] = export_srt
+    except OSError as exc:
+        append_log(meta, f"copy export srt failed: {exc}", level="WARNING")
+
+    append_log(meta, f"burned subtitles → {output_mp4}")
+    save_meta(meta)
+    meta = transition(meta, "burn_done")
+    return transition(meta, "completed")
+
+
 STEP_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "asr": step_asr,
     "translate": step_translate,
@@ -1066,21 +1143,34 @@ STEP_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "tts": step_tts,
     "render": step_render,
     "packaging": step_packaging,
+    "burn": step_burn,
 }
+
+
+def _task_mode(meta: Dict[str, Any]) -> str:
+    mode = (meta.get("mode") or (meta.get("inputs") or {}).get("mode") or "subtitle")
+    mode = str(mode).strip().lower()
+    return mode if mode in {"subtitle", "narration"} else "subtitle"
 
 
 def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional[str] = None) -> Dict[str, Any]:
     """
     同步执行从 start_step 到 stop_after（含）的步骤。
-    默认跑完整链路；copy_done 不会自动停，调用方若要人工卡点请 stop_after='copy'。
+    按 meta.mode 选择步骤链：
+      - subtitle（默认）：asr → translate → burn → completed
+      - narration：asr → … → packaging → completed
+    解说模式若要在 copy 人工卡点，请 stop_after='copy'。
     """
-    if start_step not in PIPELINE_STEPS:
-        raise ValueError(f"unknown step: {start_step}")
+    mode = _task_mode(meta)
+    steps = steps_for_mode(mode)
+    if start_step not in steps:
+        # 兼容：旧任务或跨模式重试
+        if start_step in STEP_HANDLERS:
+            steps = list(dict.fromkeys(list(steps) + [start_step]))
+        else:
+            raise ValueError(f"unknown step for mode={mode}: {start_step}")
 
-    # 入队 / 失败恢复：
-    # - draft/cancelled 必须先 queued
-    # - failed 若从 asr 整段重跑也走 queued；从中途步重跑可直接 {step}_running
-    #   （queued 现已允许任意 step_running，统一先 queued 更简单）
+    # 入队 / 失败恢复
     if meta.get("status") in {None, "draft", "failed", "cancelled"}:
         try:
             meta = transition(meta, "queued")
@@ -1090,15 +1180,14 @@ def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional
             save_meta(meta)
 
     started = False
-    for step in PIPELINE_STEPS:
+    for step in steps:
         if not started:
             if step != start_step:
                 continue
             started = True
-        # 动态取 handler，便于测试 mock 模块级函数
         handler = globals().get(f"step_{step}") or STEP_HANDLERS.get(step)
         if handler is None:
-            return _set_failed(meta, f"missing handler for step: {step}")
+            return _set_failed(meta, f"missing handler for step: {step}", step=step)
         try:
             meta = handler(meta)
         except Exception as exc:
@@ -1110,21 +1199,23 @@ def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional
             )
 
         if meta.get("status") == "failed":
-            # 兜底：handler 内 _set_failed 若未带 step，这里补上
             err = meta.get("error") or {}
             if not err.get("step"):
                 meta["error"] = {**err, "step": step, "message": err.get("message") or "failed"}
                 meta["step"] = step
                 save_meta(meta)
             return meta
+        if meta.get("status") == "completed":
+            return meta
         if stop_after and step == stop_after:
             return meta
-        # 人工卡点：默认完整跑；若环境变量要求在 copy 暂停
-        if step == "copy" and os.environ.get("CROSS_BORDER_STOP_AT_COPY", "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }:
+        # 解说模式环境变量卡点
+        if (
+            mode == "narration"
+            and step == "copy"
+            and os.environ.get("CROSS_BORDER_STOP_AT_COPY", "").lower()
+            in {"1", "true", "yes"}
+        ):
             return meta
     return meta
 
@@ -1134,13 +1225,18 @@ def run_task(task_id: str, start_step: str = "asr", stop_after: Optional[str] = 
     return run_from(meta, start_step=start_step, stop_after=stop_after)
 
 
+_STOP_AFTER_UNSET = object()
+
+
 def start_task_background(
     task_id: str,
     start_step: str = "asr",
-    stop_after: Optional[str] = "copy",
+    stop_after: Any = _STOP_AFTER_UNSET,
 ) -> bool:
     """
-    后台线程跑 pipeline。默认停在 copy（人工审文案）。
+    后台线程跑 pipeline。
+    - subtitle 模式默认跑完全程（asr→translate→burn）
+    - narration 模式默认停在 copy（人工审文案）；显式传 stop_after=None 跑完全程
     返回 False 表示已有线程在跑。
     """
     with _lock:
@@ -1148,9 +1244,22 @@ def start_task_background(
         if t and t.is_alive():
             return False
 
+        # 未显式指定时：按模式给默认 stop；显式 None 表示不卡点
+        resolved_stop: Optional[str]
+        if stop_after is _STOP_AFTER_UNSET:
+            resolved_stop = None
+            try:
+                meta0 = load_meta(task_id)
+                if _task_mode(meta0) == "narration":
+                    resolved_stop = "copy"
+            except Exception:
+                resolved_stop = None
+        else:
+            resolved_stop = stop_after  # type: ignore[assignment]
+
         def _target():
             try:
-                run_task(task_id, start_step=start_step, stop_after=stop_after)
+                run_task(task_id, start_step=start_step, stop_after=resolved_stop)
             except Exception as exc:
                 logger.exception(f"background task {task_id} failed: {exc}")
                 try:
@@ -1175,5 +1284,10 @@ def is_running(task_id: str) -> bool:
 
 
 def continue_after_copy(task_id: str) -> bool:
-    """文案审核后从 match 跑到结束。"""
+    """文案审核后从 match 跑到结束（仅 narration 模式）。"""
     return start_task_background(task_id, start_step="match", stop_after=None)
+
+
+def continue_after_translate(task_id: str) -> bool:
+    """字幕模式：审核字幕后从 burn 跑到结束。"""
+    return start_task_background(task_id, start_step="burn", stop_after=None)

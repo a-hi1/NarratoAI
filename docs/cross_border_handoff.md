@@ -8,14 +8,19 @@
 ## 一、项目一句话
 
 **NarratoAI** 是开源的影视/短剧 AI 解说文案 + 自动剪辑工具（Streamlit WebUI）。  
-我们在其之上做二开：**跨境视频本地化工厂**（不是纯机器翻译），支持 **en↔zh 双向**：
+我们在其之上做二开：**跨境视频本地化**，支持 **en↔zh 双向**，两种模式：
+
+| 模式 | 路径 | 类比 |
+|------|------|------|
+| **subtitle（默认）** | ASR → 翻译 → 硬烧字幕 | [VideoLingo](https://github.com/Huanshere/VideoLingo) |
+| **narration（高级）** | ASR → 翻译 → digest → 文案 → 匹配 → TTS → 成片 | 解说文案工厂 |
 
 | 方向 | 含义 | 典型场景 |
 |------|------|----------|
-| **Inbound 引入** | 外网英文片 → 中文解说 | 抖音/B站搬运本地化 |
-| **Outbound 出海** | 国内中文片 → 英文解说 | TikTok/YouTube 出海 |
+| **Inbound 引入** | 外网英文片 → 中文字幕/解说 | 抖音/B站搬运本地化 |
+| **Outbound 出海** | 国内中文片 → 英文字幕/解说 | TikTok/YouTube 出海 |
 
-产品定位：**带风格包、术语表、原片占比、人工审核门的本地化解说流水线**。
+默认产品路径：**翻译 + 烧字幕**（保留原声）。解说文案工厂为可选高级模式。
 
 ---
 
@@ -51,7 +56,7 @@ git push fork feat/cross-border-narration-mvp
 | **W3** | 文案层 In/Out + 6 风格包 + copy 审核门 | ✅（合在 W1） |
 | **W4** | 脚本匹配 OST + TTS（voice 服务） | ✅ `e8543b1` |
 | **W5** | 真成片 render + 包装导出 | ✅ `097e708` |
-| **W6** | 稳态：重试/超时/错误步保留/LLM 回退 | 🟡 进行中（失败步保留 + LLM 重试 + match 启发式回退已落地；压测/列表体验未做） |
+| **W6** | 稳态：重试/超时/错误步保留/LLM 回退 | 🟡 进行中（失败步保留 + LLM 重试 + match 启发式 + UI 加固 + **默认字幕本地化模式**；压测/超时可视化未做） |
 | **W7** | 真片 In+Out 打磨 prompt / 风格 | ⬜ 未做 |
 | **W8** | 商业化包装 | ⬜ 未做 |
 
@@ -67,12 +72,25 @@ match 在 LLM 不稳时可用 `CROSS_BORDER_MATCH_FALLBACK=1` 强制启发式，
 
 ## 四、流水线状态机
 
+### 字幕本地化（mode=subtitle，默认，仿 VideoLingo）
+
+```
+draft → queued
+  → asr_running → asr_done
+  → translate_running → translate_done
+  → burn_running → burn_done
+  → completed
+  ↘ failed（可从失败步重试）
+```
+
+### 解说文案工厂（mode=narration）
+
 ```
 draft → queued
   → asr_running → asr_done
   → translate_running → translate_done
   → digest_running → digest_done
-  → copy_running → copy_done          ← 默认人工门（HUMAN_GATE）
+  → copy_running → copy_done          ← 人工门（HUMAN_GATE）
   → match_running → match_done
   → tts_running → tts_done
   → render_running → render_done
@@ -81,7 +99,8 @@ draft → queued
   ↘ failed（可从失败步重试）
 ```
 
-- 默认 `stop_after="copy"`：生成到解说文案后暂停，用户改完再点「继续匹配成片」。
+- 字幕模式：后台默认跑完全程；可改 target.srt 后点「继续烧字幕」。
+- 解说模式：默认 `stop_after="copy"`，审核后再点「继续匹配成片」。
 - 任务落盘：`storage/tasks/cross_border/{task_id}/meta.json` + 各 artifact。
 - 后台：线程 + 文件轮询（避免 Streamlit 同步阻塞 / removeChild）。
 
@@ -91,14 +110,15 @@ draft → queued
 
 ```
 app/services/cross_border/
-  state_machine.py   # 状态转移、进度、HUMAN_GATES
+  state_machine.py   # 状态转移、进度、HUMAN_GATES；steps_for_mode(subtitle|narration)
   style_packs.py     # 6 套风格包（3 In + 3 Out）
   glossary.py        # 术语解析 / prompt 注入 / 锁定替换
   compliance.py      # OST 占比、改造度粗分
-  task_store.py      # create/load/save/list、artifact IO
+  task_store.py      # create/load/save/list、artifact IO；mode/bilingual 字段
   asr.py             # FunASR local/firered/bailian + whisper 回退
-  pipeline.py        # step_* + run_from + 后台线程
-  render.py          # clip/merge 成片
+  burn.py            # 双语 SRT 合并 + 硬烧（复用 generate_video.merge_materials）
+  pipeline.py        # step_* + run_from + 后台线程（含 step_burn）
+  render.py          # clip/merge 成片（解说模式）
   packaging.py       # 标题包装 + export bundle
   __init__.py
 
@@ -106,10 +126,12 @@ app/services/prompts/cross_border_narration/
   source_digest.py / narration_copy.py / script_matching.py / title_packaging.py
   → 在 app/services/prompts/__init__.py 的 initialize_prompts() 注册
 
-webui/components/cross_border_panel.py   # 新建 / 详情 / 列表
+webui/components/cross_border_panel.py   # 新建 / 详情 / 列表（默认字幕模式；可选链接下载）
 webui.py                                 # 主界面下方挂载面板
+webui/styles.py                          # 整站 UI 设计系统
 
-app/services/test_cross_border_unittest.py  # 26 个单测（mock LLM/ASR）
+app/services/cross_border/url_download.py  # yt-dlp 链接取片 → source.mp4（尽量 H.264）
+app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下载）
 ```
 
 ### 复用的主站能力（不要重复造轮子）
@@ -128,10 +150,36 @@ app/services/test_cross_border_unittest.py  # 26 个单测（mock LLM/ASR）
 - In：`in_hook_narration`（默认）、`in_roast_fast`、`in_calm_explain`
 - Out：`out_clean_explain`（默认）、`out_native_creator`、`out_brand_demo`
 
-### ASR 后端
+### ASR 后端（字幕从哪来）
 
-`auto | local | firered | bailian | whisper | manual`  
-`auto`：zh 优先 local→firered→bailian→whisper；en 优先 firered→local→bailian→whisper。
+**可以不传字幕文件。** 只上传视频时，pipeline 会自动 ASR 生成 `source.srt`：
+
+`auto | whisper | local | firered | bailian | manual`
+
+- **`auto`（默认）**：优先内置 **faster-whisper**（已写入 requirements，首次会下载 `base` 模型）→ 本地 FunASR/FireRed（仅服务可达时）→ 百炼（有 api_key 时）
+- **`whisper`**：强制 faster-whisper / openai-whisper
+- **`local` / `firered`**：本机 FunASR 服务（默认 7860 / 7867）
+- **`manual`**：必须上传 srt，否则写占位
+
+大文件加速（默认已开）：
+1. 上传流式写盘（8MB chunk，不 `getbuffer` 整文件进内存）
+2. ASR 先 ffmpeg 抽 16k mono wav，再喂 whisper（避免整段视频解码）
+3. 默认模型 `base` + `beam_size=1` + VAD 跳静音；有 CUDA 自动用 GPU
+
+环境变量：
+- `CROSS_BORDER_WHISPER_MODEL=tiny|base|small|medium`（默认 `base`）
+- `CROSS_BORDER_WHISPER_DEVICE=cpu|cuda|auto`
+- `CROSS_BORDER_WHISPER_BEAM=1..5`（默认 1）
+- `CROSS_BORDER_WHISPER_COMPUTE=int8|float16`
+
+烧录样式（`burn.py`，默认**电影字幕**）：
+- 自适应字号：横屏 `h/48`（1080p≈22），竖屏 `short/38`（约 16）；更小、贴底、细描边
+- 左右边距约 4.5% 宽，避免顶满；底部 MarginV 约 2.4% 高
+- 默认预设 `cinema`；另有 `clean` / `netflix` / `soft` / `boxed` / `yellow`
+- 位置：`bottom` / `bottom_high` / `center` / `top`
+- 字号档：`auto` / `small` / `medium` / `large` / 手动
+- UI：新建默认电影字幕；详情「改样式后重烧」只重 burn
+- 默认编码器 `libx264`
 
 ---
 
@@ -150,10 +198,14 @@ cd D:/zhuomian/Github/NarratoAI
 配置：`config.toml`（参考 `config.example.toml` 的 `[fun_asr]`、TTS、文本 LLM）。  
 **切勿把真实 Key 提交进 git。**
 
-WebUI（中文优先，工作流 Tab）：
-- **🎬 影视 / 短剧解说** — 脚本 · 配音 · 画面字幕 + 底部「成片与导出」
-- **🌍 跨境本地化** — 新建 / 详情（步骤条） / 任务列表
-- **⚙️ 基础与系统** — 语言、模型、代理、系统设置
+WebUI（中文优先，工作流 Tab，扁平浅色设计系统）：
+- **影视 / 短剧解说** — 脚本 · 配音 · 画面字幕 + 底部「成片与导出」
+- **跨境本地化** — 新建（本地上传 / **链接下载**） / 详情（彩色步骤条 + 状态卡） / 任务列表
+- **基础与系统** — 语言、模型、代理、系统设置
+
+设计系统：`webui/styles.py` + `.streamlit/config.toml` 浅色主题（primary `#2563EB`）。
+
+链接下载（可选）：`app/services/cross_border/url_download.py` 基于 **yt-dlp**，默认落 `source.mp4` 并尽量转 H.264+AAC；依赖 `requirements.txt` 中的 `yt-dlp`；国内访问 YouTube 需在设置开启代理。本地上传路径不变。
 
 默认界面语言 `zh`；`page_title` 为「NarratoAI 影视解说工坊」。
 
@@ -180,7 +232,9 @@ WebUI（中文优先，工作流 Tab）：
 - `pipeline._ensure_llm_providers` 必须从 `app.services.llm.providers` 导入（不是 `app.services.llm`）。  
 - failed 后 `error.step` 必须保留失败步；`queued` 允许进入任意 `*_running` 以便中途重试。  
 - match 提示词长、LLM 易超时 → 自动启发式回退；调试可 `CROSS_BORDER_MATCH_FALLBACK=1`。  
-- Streamlit 长任务勿同步阻塞 → 后台线程 + `meta.json` 轮询（可选 `streamlit_autorefresh`）。  
+- Streamlit 长任务勿同步阻塞 → 后台线程 + `meta.json` 轮询；**不要**依赖 `streamlit_autorefresh`（未装且易炸 DOM）。  
+- **burn WinError 206 / 长片卡 burn_running**：ffmpeg 快路径曾优先 `drawtext`（每条字幕一条滤镜），507 条字幕会把命令行撑爆 → 回退 MoviePy，AV1 长片极慢且易被重启打断。已改为**优先 `subtitles` 滤镜**；drawtext 仅作短字幕回退且 >80 条直接报错。上传视频落盘用 **ASCII 名 `source.ext`**（显示名仍用原文件名），避免中文路径踩 ffprobe。
+- **成片打不开/卡住**：imageio 自带 ffmpeg 的 **QSV 硬编**在滤镜链上可能产出坏 NAL（播放器卡死、Invalid NAL unit size）。跨境硬烧默认 **`libx264` 软编**（`inputs.video_encoder` 可覆盖）；编码参数强制 `yuv420p`。  
 - render 依赖 ffmpeg；失败时 `step_render` 回退骨架，流水线仍可 packaging。  
 - 翻译/API 路径勿把 `config.toml` 打进 commit。
 
@@ -214,10 +268,11 @@ WebUI（中文优先，工作流 Tab）：
 - 单测：app/services/test_cross_border_unittest.py（22 tests，用 .venv/Scripts/python 跑）
 
 ## 进度
-W1–W5 已完成；Inbound 真片 E2E 已跑通 completed。W6 部分完成（失败步保留、LLM 重试、match 启发式回退）。下一步优先：
-1) Outbound 真片验证
-2) W6 剩余（列表体验/超时可视化）
-3) W7 prompt / 风格打磨
+W1–W5 已完成；默认模式已切到 **subtitle（ASR→翻译→硬烧字幕，仿 VideoLingo）**。
+解说工厂保留为 mode=narration。W6 部分完成。下一步优先：
+1) 字幕模式真片 E2E（上传视频/SRT → completed 带字幕成片）
+2) Outbound 字幕/解说验证
+3) W6 剩余 / W7 打磨
 
 ## 约束
 - 匹配现有代码风格；优先复用主站 voice/fun_asr/clip/merge，不重造轮子

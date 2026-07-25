@@ -327,6 +327,7 @@ def render_script_panel(tr):
     """渲染脚本配置面板"""
     with st.container(border=True):
         st.write(tr("Video Script Configuration"))
+        st.caption("先选工作模式与视频，再生成/上传脚本。这是成片的起点。")
         params = VideoClipParams()
 
         # 渲染脚本文件选择
