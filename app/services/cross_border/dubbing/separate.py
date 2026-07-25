@@ -93,22 +93,40 @@ def _run_demucs(source_wav: str, out_dir: str) -> Dict[str, str]:
     if os.path.isdir(work):
         shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
+    # 优先用当前解释器；CPU 上控制 jobs，避免把机器打满又几乎不加速
+    import sys
+
+    try:
+        cpu = os.cpu_count() or 2
+    except Exception:
+        cpu = 2
+    # demucs -j 是加载/处理并行；CPU 上 1–2 往往更稳，可用环境变量覆盖
+    jobs_raw = (os.environ.get("CROSS_BORDER_DEMUCS_JOBS") or "").strip()
+    try:
+        jobs = int(jobs_raw) if jobs_raw else min(2, max(1, cpu // 2))
+    except ValueError:
+        jobs = 1
+    jobs = max(1, min(4, jobs))
+
     cmd = [
-        os.environ.get("PYTHON", "") or shutil.which("python") or "python",
+        sys.executable,
         "-m",
         "demucs",
         "-n",
         "htdemucs",
         "--two-stems",
         "vocals",
+        "-j",
+        str(jobs),
         "-o",
         work,
         source_wav,
     ]
-    # 优先用当前解释器
-    import sys
-
-    cmd[0] = sys.executable
+    # 有 CUDA 时 demucs 自己会用；强制 CPU 可设 CROSS_BORDER_DEMUCS_DEVICE=cpu
+    device = (os.environ.get("CROSS_BORDER_DEMUCS_DEVICE") or "").strip()
+    if device:
+        cmd.extend(["-d", device])
+    logger.info(f"demucs start jobs={jobs} device={device or 'auto'} file={source_wav}")
     r = subprocess.run(
         cmd,
         capture_output=True,

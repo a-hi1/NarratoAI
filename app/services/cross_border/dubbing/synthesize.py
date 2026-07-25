@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -31,6 +32,8 @@ _TIME_LINE = re.compile(
 # 单批 amix 输入上限（ffmpeg 滤镜图复杂度）
 _BATCH_SIZE = 40
 _MAX_SEGMENTS = 200
+# 逐句 TTS 默认并发；Edge/豆包等网络 TTS 收益最大。可用环境变量覆盖。
+_DEFAULT_TTS_WORKERS = 4
 
 
 def _ffmpeg() -> str:
@@ -163,6 +166,29 @@ def _audio_duration(path: str) -> float:
     return 1.0
 
 
+def _tts_worker_count(engine: str = "") -> int:
+    """
+    网络 TTS 适合有限并发；本地克隆默认串行。
+    Edge 并发过高易触发 NoAudioReceived/限流，默认 2；豆包等云端默认 4。
+    可用 CROSS_BORDER_TTS_WORKERS 覆盖。
+    """
+    raw = (os.environ.get("CROSS_BORDER_TTS_WORKERS") or "").strip()
+    eng = (engine or "").strip().lower() or "edge_tts"
+    if eng in {"indextts", "indextts2", "omnivoice", "soulvoice", "voxcpm"}:
+        default = 1
+    elif eng in {"edge_tts", "edge", "azure_speech", "azure"}:
+        default = 2
+    else:
+        default = _DEFAULT_TTS_WORKERS
+    if not raw:
+        return max(1, int(default))
+    try:
+        n = int(raw)
+    except ValueError:
+        n = default
+    return max(1, min(16, n))
+
+
 def synthesize_cues_to_dir(
     cues: List[Dict[str, Any]],
     tts_dir: str,
@@ -171,17 +197,42 @@ def synthesize_cues_to_dir(
     voice_rate: float = 1.0,
     voice_pitch: float = 1.0,
     tts_engine: str = "edge_tts",
+    workers: Optional[int] = None,
+    reuse_existing: bool = True,
 ) -> List[Dict[str, Any]]:
+    """
+    逐句 TTS。默认并发（Edge/云端）；已存在且非空的 mp3 可复用，便于卡住后重跑。
+    """
     os.makedirs(tts_dir, exist_ok=True)
-    results: List[Dict[str, Any]] = []
+    jobs: List[Dict[str, Any]] = []
     for cue in cues:
         cid = int(cue["id"])
         text = str(cue.get("text") or "").strip()
         if not text:
             continue
         out = os.path.join(tts_dir, f"{cid:04d}.mp3")
+        jobs.append(
+            {
+                "id": cid,
+                "start": float(cue["start"]),
+                "end": float(cue["end"]),
+                "text": text,
+                "audio_file": out,
+                "slot": max(0.1, float(cue["end"]) - float(cue["start"])),
+            }
+        )
+
+    def _run_one(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        out = job["audio_file"]
+        if (
+            reuse_existing
+            and os.path.isfile(out)
+            and os.path.getsize(out) > 100
+        ):
+            dur = _audio_duration(out)
+            return {**job, "duration": dur, "reused": True}
         ok = _tts_one(
-            text,
+            job["text"],
             out,
             voice_name=voice_name,
             voice_rate=voice_rate,
@@ -189,20 +240,40 @@ def synthesize_cues_to_dir(
             tts_engine=tts_engine,
         )
         if not ok:
-            logger.warning(f"skip cue {cid}: tts failed")
-            continue
+            logger.warning(f"skip cue {job['id']}: tts failed")
+            return None
         dur = _audio_duration(out)
-        results.append(
-            {
-                "id": cid,
-                "start": float(cue["start"]),
-                "end": float(cue["end"]),
-                "text": text,
-                "audio_file": out,
-                "duration": dur,
-                "slot": max(0.1, float(cue["end"]) - float(cue["start"])),
-            }
-        )
+        return {**job, "duration": dur, "reused": False}
+
+    n_workers = int(workers) if workers is not None else _tts_worker_count(tts_engine)
+    n_workers = max(1, min(16, n_workers, max(1, len(jobs))))
+    logger.info(
+        f"dub TTS: {len(jobs)} cues, workers={n_workers}, engine={tts_engine or 'edge_tts'}"
+    )
+
+    results: List[Dict[str, Any]] = []
+    if n_workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            row = _run_one(job)
+            if row:
+                results.append(row)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = {pool.submit(_run_one, job): job["id"] for job in jobs}
+            for fut in as_completed(futs):
+                cid = futs[fut]
+                try:
+                    row = fut.result()
+                except Exception as exc:
+                    logger.warning(f"skip cue {cid}: tts worker error: {exc}")
+                    continue
+                if row:
+                    results.append(row)
+
+    results.sort(key=lambda r: int(r["id"]))
+    reused = sum(1 for r in results if r.get("reused"))
+    if reused:
+        logger.info(f"dub TTS reused {reused}/{len(results)} existing clips")
     return results
 
 

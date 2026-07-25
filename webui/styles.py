@@ -492,6 +492,91 @@ section[data-testid="stSidebar"] {{
   letter-spacing: -0.01em;
 }}
 
+/* 字幕节点实时面板 */
+.na-cue-panel {{
+  background: var(--na-surface);
+  border: 1px solid var(--na-border);
+  border-radius: var(--na-radius);
+  padding: 0.75rem 0.9rem 0.6rem;
+  box-shadow: var(--na-shadow);
+  margin: 0.35rem 0 0.6rem;
+}}
+.na-cue-head {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  color: var(--na-text);
+  font-size: 0.95rem;
+}}
+.na-cue-sub {{
+  color: var(--na-muted);
+  font-size: 0.82rem;
+  margin-bottom: 0.5rem;
+  line-height: 1.45;
+}}
+.na-cue-list {{
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-right: 0.15rem;
+}}
+.na-cue {{
+  border: 1px solid var(--na-border);
+  border-radius: var(--na-radius-sm);
+  background: var(--na-surface-2);
+  padding: 0.45rem 0.55rem;
+}}
+.na-cue.ready {{
+  border-color: rgba(5, 150, 105, 0.28);
+  background: var(--na-success-soft);
+}}
+.na-cue.pending {{
+  border-color: rgba(217, 119, 6, 0.28);
+  background: var(--na-warning-soft);
+}}
+.na-cue.idle {{
+  color: var(--na-muted);
+}}
+.na-cue-meta {{
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  color: var(--na-muted);
+  margin-bottom: 0.18rem;
+}}
+.na-cue-id {{
+  font-weight: 700;
+  color: var(--na-text-2);
+  min-width: 2.2rem;
+}}
+.na-cue-time {{
+  font-variant-numeric: tabular-nums;
+  flex: 1;
+}}
+.na-cue-mark {{
+  font-weight: 700;
+  color: var(--na-success);
+}}
+.na-cue.pending .na-cue-mark {{
+  color: var(--na-warning);
+}}
+.na-cue-text {{
+  color: var(--na-text);
+  font-size: 0.9rem;
+  line-height: 1.45;
+  word-break: break-word;
+}}
+.na-cue-foot {{
+  margin-top: 0.4rem;
+  color: var(--na-muted);
+  font-size: 0.78rem;
+}}
+
 /* 可点击元素 */
 button, [role="button"], a {{
   cursor: pointer;
@@ -802,3 +887,51 @@ def status_panel_html(
       {extras}
     </div>
     """
+
+
+def subtitle_cues_html(
+    cues: Sequence[dict],
+    *,
+    max_items: int = 40,
+    title: str = "字幕节点",
+    subtitle: str = "",
+    pending_prefix: str = "…",
+) -> str:
+    """
+    渲染字幕 cue 节点列表。
+    cue: {id, start, end, text, pending?}
+    """
+    rows = list(cues or [])
+    total = len(rows)
+    shown = rows[: max(1, int(max_items or 40))]
+    more = total - len(shown)
+    items = []
+    for cue in shown:
+        cid = escape(str(cue.get("id") or ""))
+        start = escape(str(cue.get("start") or ""))
+        end = escape(str(cue.get("end") or ""))
+        text = escape(str(cue.get("text") or "").strip() or "（空）")
+        pending = bool(cue.get("pending"))
+        cls = "pending" if pending else "ready"
+        mark = escape(pending_prefix) if pending else "✓"
+        items.append(
+            f'<div class="na-cue {cls}">'
+            f'<div class="na-cue-meta"><span class="na-cue-id">#{cid}</span>'
+            f'<span class="na-cue-time">{start} → {end}</span>'
+            f'<span class="na-cue-mark">{mark}</span></div>'
+            f'<div class="na-cue-text">{text}</div></div>'
+        )
+    if not items:
+        items.append('<div class="na-cue idle"><div class="na-cue-text">暂无字幕节点</div></div>')
+    foot = ""
+    if more > 0:
+        foot = f'<div class="na-cue-foot">还有 {more} 条未展开</div>'
+    sub = f'<div class="na-cue-sub">{escape(subtitle)}</div>' if subtitle else ""
+    return (
+        f'<div class="na-cue-panel">'
+        f'<div class="na-cue-head"><strong>{escape(title)}</strong>'
+        f'<span class="narrato-chip">{total} 条</span></div>'
+        f"{sub}"
+        f'<div class="na-cue-list">{"".join(items)}</div>'
+        f"{foot}</div>"
+    )

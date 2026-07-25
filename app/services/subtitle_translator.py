@@ -249,10 +249,30 @@ def _call_progress_callback(
         logger.debug(f"字幕翻译进度回调失败: {exc}")
 
 
-def _render_translated_srt(blocks, translations: dict[int, str]) -> str:
+def _render_translated_srt(
+    blocks,
+    translations: dict[int, str],
+    *,
+    pending_mode: str = "empty",
+) -> str:
+    """
+    pending_mode:
+      - empty: 未译条目正文为空（最终成品用）
+      - source: 未译条目暂时显示原文（实时预览用）
+      - ellipsis: 未译条目显示「… 原文」
+    """
     rendered_blocks = []
+    mode = (pending_mode or "empty").strip().lower()
     for block in blocks:
-        translated_text = translations.get(block.order, "")
+        if block.order in translations:
+            translated_text = translations.get(block.order, "") or ""
+        elif mode == "source":
+            translated_text = block.text or ""
+        elif mode in {"ellipsis", "pending", "…"}:
+            src = (block.text or "").strip()
+            translated_text = f"… {src}" if src else "…"
+        else:
+            translated_text = ""
         rendered_blocks.append(f"{block.index_line}\n{block.time_line}\n{translated_text}")
     return "\n\n".join(rendered_blocks).rstrip() + "\n"
 
@@ -270,6 +290,8 @@ def translate_srt_content(
     max_workers: int | None = None,
     progress_callback: TranslationProgressCallback | None = None,
     glossary_block: str = "",
+    partial_output_file: str = "",
+    partial_pending_mode: str = "ellipsis",
 ) -> str:
     target_language = str(target_language or "").strip() or "中文"
     blocks = parse_srt_blocks(srt_content)
@@ -292,12 +314,42 @@ def translate_srt_content(
 
     translations: dict[int, str] = {}
     completed_blocks = 0
-    _call_progress_callback(
-        progress_callback,
-        0,
-        total_blocks,
-        f"开始翻译字幕，共 {total_blocks} 条，{total_chunks} 批",
-    )
+    partial_path = (partial_output_file or "").strip()
+    # 长字幕实时写盘节流：只在「首批 / 每 N 批 / 完成」写，避免每批重写整份 SRT 拖慢翻译
+    # 小任务（≤2 批）仍每批写；大任务按批次数自适应
+    if total_chunks <= 2:
+        _partial_every = 1
+    elif total_chunks <= 10:
+        _partial_every = 2
+    else:
+        _partial_every = max(2, total_chunks // 8)  # 大约写 8 次预览
+    _partial_writes = 0
+
+    def _emit_partial(completed: int, message: str, *, force_write: bool = False, chunk_index: int = 0) -> None:
+        nonlocal _partial_writes
+        should_write = False
+        if partial_path:
+            if force_write or completed <= 0 or completed >= total_blocks:
+                should_write = True
+            elif chunk_index > 0 and (
+                chunk_index == 1 or chunk_index % _partial_every == 0
+            ):
+                should_write = True
+        if should_write and partial_path:
+            try:
+                # 实时预览：未完成条目先显示原文/省略号，避免空白节点
+                partial = _render_translated_srt(
+                    blocks,
+                    translations,
+                    pending_mode=partial_pending_mode or "ellipsis",
+                )
+                write_srt_file(partial, partial_path)
+                _partial_writes += 1
+            except Exception as exc:
+                logger.warning(f"partial srt write failed: {exc}")
+        _call_progress_callback(progress_callback, completed, total_blocks, message)
+
+    _emit_partial(0, f"开始翻译字幕，共 {total_blocks} 条，{total_chunks} 批", force_write=True)
 
     if total_chunks == 1:
         translations.update(
@@ -316,7 +368,7 @@ def translate_srt_content(
             )
         )
         completed_blocks = total_blocks
-        _call_progress_callback(progress_callback, completed_blocks, total_blocks, "字幕翻译完成")
+        _emit_partial(completed_blocks, "字幕翻译完成", force_write=True)
     else:
         with ThreadPoolExecutor(max_workers=resolved_max_workers) as executor:
             future_to_meta = {}
@@ -348,14 +400,29 @@ def translate_srt_content(
                     f"完成批次 {chunk_index}/{total_chunks}"
                 )
                 logger.info(message)
-                _call_progress_callback(progress_callback, completed_blocks, total_blocks, message)
+                _emit_partial(
+                    completed_blocks,
+                    message,
+                    force_write=(completed_blocks >= total_blocks),
+                    chunk_index=int(chunk_index),
+                )
 
     missing_ids = sorted({block.order for block in blocks} - set(translations.keys()))
     if missing_ids:
         raise SubtitleTranslationError(f"字幕翻译结果缺少字幕条目: {missing_ids[:10]}")
 
-    translated_srt = _render_translated_srt(blocks, translations)
-    logger.info(f"字幕翻译完成，共 {total_blocks} 条")
+    translated_srt = _render_translated_srt(blocks, translations, pending_mode="empty")
+    if partial_path:
+        try:
+            write_srt_file(translated_srt, partial_path)
+        except Exception as exc:
+            logger.warning(f"final partial srt write failed: {exc}")
+    if _partial_writes:
+        logger.info(
+            f"字幕翻译完成，共 {total_blocks} 条；实时预览写盘 {_partial_writes} 次（节流 every≈{_partial_every} 批）"
+        )
+    else:
+        logger.info(f"字幕翻译完成，共 {total_blocks} 条")
     return translated_srt
 
 
@@ -384,11 +451,14 @@ def translate_subtitle_file(
     max_workers: int | None = None,
     progress_callback: TranslationProgressCallback | None = None,
     glossary_block: str = "",
+    write_partial: bool = True,
 ) -> str:
     if not subtitle_file or not os.path.isfile(subtitle_file):
         raise SubtitleTranslationError(f"字幕文件不存在: {subtitle_file}")
 
     decoded = read_subtitle_text(subtitle_file)
+    # 默认边译边写到 output_file，供 UI 实时展示字幕节点
+    partial_path = (output_file or "").strip() if write_partial else ""
     translated_srt = translate_srt_content(
         decoded.text,
         target_language=target_language,
@@ -401,5 +471,7 @@ def translate_subtitle_file(
         max_workers=max_workers,
         progress_callback=progress_callback,
         glossary_block=glossary_block,
+        partial_output_file=partial_path,
+        partial_pending_mode="ellipsis",
     )
     return write_srt_file(translated_srt, output_file)

@@ -312,11 +312,48 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = apply_locked_terms(text or "", glossary_items)
         write_text_artifact(task_id, "target.srt", cleaned.strip() + "\n")
         meta["artifacts"]["target_srt"] = target_srt
+        # 清理实时进度字段
+        meta.pop("translate_progress", None)
         append_log(meta, f"translated via {via}")
         if glossary_items:
             append_log(meta, f"glossary applied ({len(glossary_items)} terms)")
         save_meta(meta)
         return transition(meta, "translate_done")
+
+    # 进度 meta 写盘节流：长片每批都 save 会和 Windows 文件锁打架；约 1.2s 一次足够 UI
+    _progress_last_save = [0.0]
+
+    def _on_translate_progress(completed: int, total: int, message: str) -> None:
+        """边译边写进度，供详情页实时展示字幕节点（节流写 meta）。"""
+        try:
+            import time as _time
+
+            total_i = max(0, int(total or 0))
+            done_i = max(0, int(completed or 0))
+            pct = int(round(100.0 * done_i / total_i)) if total_i else 0
+            # translate 在状态机里约 20–40%，用子进度填中间段
+            base, span = 22, 18
+            meta["progress"] = min(39, base + int(span * pct / 100.0))
+            meta["translate_progress"] = {
+                "completed": done_i,
+                "total": total_i,
+                "percent": pct,
+                "message": str(message or "")[:240],
+            }
+            meta["artifacts"]["target_srt"] = target_srt
+            now = _time.monotonic()
+            is_edge = done_i <= 0 or (total_i and done_i >= total_i)
+            # 不全量 append_log；只偶尔记一条
+            if total_i and (
+                is_edge or done_i % max(1, total_i // 5) == 0
+            ):
+                append_log(meta, str(message or f"translate {done_i}/{total_i}")[:200])
+            # 节流：边缘节点必写；中间最多约 1.2s 一次
+            if is_edge or (now - _progress_last_save[0]) >= 1.2:
+                save_meta(meta)
+                _progress_last_save[0] = now
+        except Exception as exc:
+            logger.warning(f"translate progress callback failed: {exc}")
 
     try:
         from app.services.subtitle_translator import translate_subtitle_file
@@ -326,6 +363,8 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
             target_srt,
             target_language=lang_label,
             glossary_block=glossary_block if glossary_items else "",
+            progress_callback=_on_translate_progress,
+            write_partial=True,
         )
         if out and os.path.isfile(out):
             with open(out, encoding="utf-8") as fp:
@@ -357,6 +396,7 @@ def step_translate(meta: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc2:
             shutil.copy2(source_srt, target_srt)
             meta["artifacts"]["target_srt"] = target_srt
+            meta.pop("translate_progress", None)
             append_log(meta, f"translate fallback copy source: {exc2}", level="WARNING")
             save_meta(meta)
             return transition(meta, "translate_done")
@@ -1151,6 +1191,12 @@ def step_dub_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
     voice_rate = float(inputs.get("voice_rate") or 1.0)
     voice_pitch = float(inputs.get("voice_pitch") or 1.0)
     tts_engine = (inputs.get("tts_engine") or "edge_tts").strip() or "edge_tts"
+    workers = synth_mod._tts_worker_count(tts_engine)
+    append_log(
+        meta,
+        f"dub_tts start lang={lang} voice={voice_name} engine={tts_engine} workers={workers}",
+    )
+    save_meta(meta)
 
     try:
         result = synth_mod.synthesize_from_srt(

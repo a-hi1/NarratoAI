@@ -202,6 +202,9 @@ app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下
 - **原片硬字幕遮罩条（手动）**：`subtitle_mask_enabled` + `side`(bottom/top) + `height%` + `color`(black/translucent) + `subtitle_on_mask`；burn 时 ffmpeg `drawbox` 盖住原字幕区再烧译文（不识别、不擦除）
 - UI：新建默认电影字幕；详情「改样式后重烧」只重 burn
 - 默认编码器 `libx264`
+- **实时字幕节点**：翻译时按批次增量写 `target.srt`（未译条目暂显 `… 原文`）；详情页用 `st.fragment(run_every=2s)` 局部刷新源/目标节点卡片，不整页 auto-rerun
+  - `meta.translate_progress = {completed,total,percent,message}`
+  - 状态条进度在 translate 阶段约 22–40% 随批次推进
 
 ### 多语配音（mode=dubbing）要点
 
@@ -221,10 +224,16 @@ app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下
 - **混音默认音量（重要）**：伴奏 `0.55` / 配音 `1.8`。旧默认 0.9/1.15 会把中文 TTS 盖成「只有背景音」。
   - sidechain 必须用 `asplit` 分叉人声标签，不能同一 `[vc]` 既喂 sidechain 又 amix
   - 旧任务重混时若仍是 0.9/1.15，pipeline 会自动抬到 0.55/1.8
-- **多语**：`dubbing/voices.py` 内置 15 语默认 Edge 音色；UI 高级可快捷选目标语
-- **inputs 字段**：`separate_backend` / `duck_gain` / `instrumental_volume` / `dub_voice_volume` / `voice_gender` / `burn_after_mix` / `sidechain_duck`
-- **UI**：新建「多语配音（实验）」；详情可换音色重配 / 重分离 / 重混
-- **限制（已知）**：CPU demucs 慢；sidechain 依赖 ffmpeg；TTS 句数默认截断 200；翻译质量仍偏 en↔zh
+- **速度**：
+  - `dub_tts`：Edge/Azure 默认 **2 路**（过高易限流），豆包等云端默认 **4 路**，本地克隆默认串行。环境变量 `CROSS_BORDER_TTS_WORKERS=1..16`
+  - 已生成的 `dub/tts_lines/*.mp3` **可复用**，卡住重跑不会从头合成
+  - demucs CPU 默认 `-j 1~2`；`CROSS_BORDER_DEMUCS_JOBS` / `CROSS_BORDER_DEMUCS_DEVICE=cpu|cuda`
+  - 只要背景、可接受轻微残留人声：新建时分离方式改 `center_cancel` 或 `duck`（秒级，比 demucs 快一个数量级）
+- **多语**：`dubbing/voices.py` 内置 15 语默认 Edge 音色 + 引擎/预设列表（Edge 中英日韩、豆包 BV*）
+- **inputs 字段**：`separate_backend` / `duck_gain` / `instrumental_volume` / `dub_voice_volume` / `voice_gender` / `burn_after_mix` / `sidechain_duck` / `tts_engine` / `voice_name` / `voice_rate` / `voice_pitch`
+- **UI**：新建「多语配音」展开 **④ 配音与字幕样式**（引擎/性别/预设/音色 ID/语速音调/分离混音）；高级只改目标语种；详情可换音色重配 / 重分离 / 重混
+- **自定义音色（规划）**：上传参考 wav + IndexTTS/IndexTTS2 克隆，当前未做上传入口，可选引擎 `indextts` 并手填参考路径
+- **限制（已知）**：CPU demucs 仍慢；sidechain 依赖 ffmpeg；TTS 句数默认截断 200；翻译质量仍偏 en↔zh
 
 ---
 

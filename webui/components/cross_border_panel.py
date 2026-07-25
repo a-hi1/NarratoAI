@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -28,6 +29,10 @@ from app.services.cross_border.style_packs import (
     style_choices_for_ui,
 )
 from webui import styles as ui_styles
+
+_SRT_TIME = re.compile(
+    r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})"
+)
 
 
 def _tr(tr, key: str, default: Optional[str] = None) -> str:
@@ -240,8 +245,17 @@ def _status_badge(meta: Dict[str, Any]) -> str:
             f"分离后端：{(meta.get('artifacts') or {}).get('separate_backend') or '-'}。"
             " 可继续配音 TTS。"
         )
+    tp = meta.get("translate_progress") or {}
+    if status == "translate_running" and tp:
+        done = tp.get("completed")
+        total = tp.get("total")
+        msg = str(tp.get("message") or "").strip()
+        if total:
+            extras.append(f"翻译节点 {done}/{total}" + (f" · {msg}" if msg else ""))
+        elif msg:
+            extras.append(msg)
     if cb_pipeline.is_running(meta.get("task_id") or ""):
-        extras.append("后台任务运行中…请点「刷新状态」查看进度。")
+        extras.append("后台任务运行中…字幕节点会局部自动刷新；状态条请点「刷新状态」。")
 
     return ui_styles.status_panel_html(
         mode_label=_MODE_CN.get(mode, mode),
@@ -260,17 +274,198 @@ def _safe_rerun() -> None:
     st.rerun()
 
 
+def _parse_srt_cues_for_ui(text: str, *, limit: int = 200) -> List[Dict[str, Any]]:
+    """轻量解析 SRT → UI 节点；不依赖 dubbing 模块。"""
+    if not text or not str(text).strip():
+        return []
+    blocks = re.split(r"\n\s*\n", str(text).strip())
+    cues: List[Dict[str, Any]] = []
+    idx = 0
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.strip().splitlines() if ln.strip() != ""]
+        if len(lines) < 2:
+            continue
+        if re.match(r"^\d+$", lines[0]) and len(lines) >= 3:
+            time_line = lines[1]
+            body_lines = lines[2:]
+            try:
+                idx = int(lines[0])
+            except ValueError:
+                idx += 1
+        else:
+            time_line = lines[0]
+            body_lines = lines[1:]
+            idx += 1
+        m = _SRT_TIME.search(time_line)
+        if not m:
+            continue
+        body = "\n".join(body_lines).strip()
+        pending = body.startswith("…") or body.startswith("...")
+        if pending:
+            # 去掉预览用的省略号前缀
+            body = re.sub(r"^[…\.]+\s*", "", body)
+        cues.append(
+            {
+                "id": idx,
+                "start": m.group(1).replace(".", ","),
+                "end": m.group(2).replace(".", ","),
+                "text": body,
+                "pending": pending,
+            }
+        )
+        if len(cues) >= max(1, int(limit or 200)):
+            break
+    return cues
+
+
+def _srt_path_for_task(meta: Dict[str, Any], which: str) -> str:
+    task_id = meta.get("task_id") or ""
+    arts = meta.get("artifacts") or {}
+    key = "source_srt" if which == "source" else "target_srt"
+    path = arts.get(key) or ""
+    if path and os.path.isfile(path):
+        return path
+    name = "source.srt" if which == "source" else "target.srt"
+    if task_id:
+        p = task_store.artifact_path(task_id, name)
+        if os.path.isfile(p):
+            return p
+    return path or ""
+
+
+def _render_live_subtitle_nodes(meta: Dict[str, Any], *, running: bool) -> None:
+    """
+    实时字幕节点：读取磁盘上的 source/target.srt（翻译中会增量写 target）。
+    运行中用 st.fragment(run_every=2s) 局部刷新，避免整页 auto-rerun。
+    """
+    status = meta.get("status") or ""
+    mode = _task_mode(meta)
+    if mode not in {"subtitle", "dubbing"}:
+        return
+
+    show_live = running or status in {
+        "asr_running",
+        "asr_done",
+        "translate_running",
+        "translate_done",
+        "burn_running",
+        "burn_done",
+        "completed",
+        "separate_running",
+        "separate_done",
+        "dub_tts_running",
+        "dub_tts_done",
+        "mix_running",
+        "mix_done",
+        "failed",
+    }
+    if not show_live:
+        return
+
+    task_id = meta.get("task_id") or ""
+    tp = meta.get("translate_progress") or {}
+    want_auto = bool(
+        running
+        and status
+        in {
+            "asr_running",
+            "translate_running",
+            "burn_running",
+            "separate_running",
+            "dub_tts_running",
+            "mix_running",
+        }
+    )
+
+    def _draw() -> None:
+        # fragment 内重新读盘，才能看到后台增量写入
+        try:
+            live_meta = task_store.load_meta(task_id) if task_id else meta
+        except Exception:
+            live_meta = meta
+        live_status = live_meta.get("status") or status
+        live_tp = live_meta.get("translate_progress") or tp
+        src_path = _srt_path_for_task(live_meta, "source")
+        tgt_path = _srt_path_for_task(live_meta, "target")
+        src_text = task_store.read_text_artifact(src_path) if src_path else ""
+        tgt_text = task_store.read_text_artifact(tgt_path) if tgt_path else ""
+        src_cues = _parse_srt_cues_for_ui(src_text, limit=80)
+        tgt_cues = _parse_srt_cues_for_ui(tgt_text, limit=80)
+
+        # 翻译进度条（有则显示）
+        if live_status == "translate_running" or live_tp:
+            done = int(live_tp.get("completed") or 0)
+            total = int(live_tp.get("total") or 0)
+            msg = str(live_tp.get("message") or "")
+            if total > 0:
+                st.caption(f"翻译进度 **{done}/{total}** · {msg}")
+                st.progress(min(1.0, max(0.0, done / float(total))))
+            elif msg:
+                st.caption(msg)
+
+        if live_status == "asr_running" and not src_cues:
+            st.info("正在识别台词… 识别完成后会先出现源字幕节点，再开始翻译。")
+        elif live_status == "translate_running" and not tgt_cues and src_cues:
+            st.info("正在翻译… 批次完成后节点会逐条从「…」变为已译。")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(
+                ui_styles.subtitle_cues_html(
+                    src_cues,
+                    max_items=24,
+                    title="源字幕节点",
+                    subtitle=f"{os.path.basename(src_path) if src_path else 'source.srt'}"
+                    + (f" · {len(src_cues)} 条" if src_cues else " · 等待识别"),
+                ),
+                unsafe_allow_html=True,
+            )
+        with c2:
+            pending_n = sum(1 for c in tgt_cues if c.get("pending"))
+            ready_n = len(tgt_cues) - pending_n
+            sub = (
+                f"已译 {ready_n}"
+                + (f" · 待译/预览 {pending_n}" if pending_n else "")
+                + (f" · {live_status}" if live_status else "")
+            )
+            st.markdown(
+                ui_styles.subtitle_cues_html(
+                    tgt_cues,
+                    max_items=24,
+                    title="目标字幕节点（实时）",
+                    subtitle=sub or "等待翻译写入 target.srt",
+                ),
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("##### 字幕节点")
+    if want_auto and hasattr(st, "fragment"):
+        # 局部刷新：长任务 3s 足够，比 2s 更省 CPU；只重绘本块
+        @st.fragment(run_every=3)
+        def _live_fragment() -> None:
+            _draw()
+
+        _live_fragment()
+        st.caption("运行中每 3 秒自动刷新字幕节点（局部刷新，几乎不拖慢后台生成）。")
+    else:
+        _draw()
+
+
 def _maybe_auto_refresh(task_id: str) -> None:
     """
-    不自动 st.rerun()。
+    不自动 st.rerun() 整页。
 
     Streamlit 1.x 在外层 tabs + 复杂详情树下，周期性整页 rerun
-    极易触发浏览器 removeChild NotFoundError。进度请点「刷新状态」。
+    极易触发浏览器 removeChild NotFoundError。
+    进度请点「刷新状态」；字幕节点在详情内用 st.fragment 局部刷新。
     前端已注入 removeChild 防护，偶发红框也会被隐藏。
     """
     if not task_id or not cb_pipeline.is_running(task_id):
         return
-    st.info("后台仍在运行。请点上方「刷新状态」查看进度（已关闭自动刷新，避免页面崩溃）。")
+    st.info(
+        "后台仍在运行。字幕节点区会局部自动刷新；"
+        "状态条/进度请点上方「刷新状态」（已关闭整页自动刷新，避免页面崩溃）。"
+    )
 
 
 def _render_create_form(tr):
@@ -437,6 +632,11 @@ def _render_create_form(tr):
     voice_gender = "female"
     burn_after_mix = True
     sidechain_duck = True
+    # 音色/引擎：配音在 expander 里填；解说在高级里填；这里只做初值
+    voice_name = "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
+    tts_engine = "edge_tts" if mode == "dubbing" else ""
+    voice_rate = 1.0
+    voice_pitch = 1.0
 
     if mode in {"subtitle", "dubbing"}:
         from app.services.cross_border import burn as burn_mod
@@ -462,13 +662,123 @@ def _render_create_form(tr):
                         "未安装 demucs/torch：将降级为中置削弱/压低原声。"
                         " 真分离：`.venv/Scripts/python -m pip install torch demucs`"
                     )
+
+                # —— 配音音色控制（新建即可换，不必等任务详情）——
+                st.markdown("##### 配音音色（可换）")
+                eng_choices = voices_mod.engine_choices_for_ui()
+                eng_ids = [e for e, _ in eng_choices]
+                eng_labels = {e: lab for e, lab in eng_choices}
+                if "cb_tts_engine_dub" not in st.session_state:
+                    st.session_state["cb_tts_engine_dub"] = "edge_tts"
+                tts_engine = st.selectbox(
+                    "TTS 引擎",
+                    options=eng_ids,
+                    format_func=lambda k: eng_labels.get(k, k or "跟随全局"),
+                    key="cb_tts_engine_dub",
+                    help="Edge 免费但偏机械；豆包/Qwen 更自然；IndexTTS 可克隆参考音（需本地服务）。",
+                )
+                gcol_a, gcol_b = st.columns(2)
+                with gcol_a:
+                    gender_label = st.selectbox(
+                        "音色性别",
+                        options=["女声", "男声"],
+                        index=0,
+                        key="cb_voice_gender",
+                    )
+                    voice_gender = "male" if gender_label.startswith("男") else "female"
+                with gcol_b:
+                    # 目标语：跟方向默认，可在高级改；这里用于筛预设
+                    tgt_for_voice = (
+                        st.session_state.get("cb_target_lang")
+                        or ("zh" if direction == "inbound" else "en")
+                    )
+                    tgt_for_voice = voices_mod.normalize_lang(str(tgt_for_voice))
+                    st.caption(f"当前按目标语 **{tgt_for_voice}** 筛选预设（高级可改语种）")
+
+                presets = voices_mod.presets_for_engine(
+                    tts_engine or "edge_tts",
+                    tgt_for_voice,
+                    gender=voice_gender,
+                )
+                preset_ids = [p[0] for p in presets]
+                preset_lab = {p[0]: p[1] for p in presets}
+                # 性别/引擎/语种变化时，若当前音色不在列表则切到第一项
+                cur_voice = (st.session_state.get("cb_voice_name") or "").strip()
+                sync_key = f"{tts_engine}|{tgt_for_voice}|{voice_gender}"
+                if st.session_state.get("cb_voice_sync_key") != sync_key:
+                    st.session_state["cb_voice_sync_key"] = sync_key
+                    if preset_ids and (not cur_voice or cur_voice not in preset_ids):
+                        # 空 id 的占位（克隆引擎）不强制写入
+                        first = next((x for x in preset_ids if x), "")
+                        if first:
+                            st.session_state["cb_voice_name"] = first
+                            cur_voice = first
+                    st.session_state["cb_dub_voice_lang"] = tgt_for_voice
+
+                if preset_ids and any(preset_ids):
+                    # 选项直接用 voice id，避免语种/性别切换后 index 错位
+                    if st.session_state.get("cb_voice_preset") not in preset_ids:
+                        preferred = cur_voice if cur_voice in preset_ids else next(
+                            (x for x in preset_ids if x), preset_ids[0]
+                        )
+                        st.session_state["cb_voice_preset"] = preferred
+                    picked_id = st.selectbox(
+                        "音色预设",
+                        options=preset_ids,
+                        format_func=lambda vid: preset_lab.get(vid, vid or "（自定义）"),
+                        key="cb_voice_preset",
+                        help="选预设会写入下方音色 ID；也可直接改 ID。",
+                    )
+                    if picked_id and st.session_state.get("cb_voice_name") != picked_id:
+                        st.session_state["cb_voice_name"] = picked_id
+
+                if "cb_voice_name" not in st.session_state:
+                    st.session_state["cb_voice_name"] = voices_mod.default_voice_for_lang(
+                        tgt_for_voice, gender=voice_gender
+                    )
+                voice_name = st.text_input(
+                    "音色 ID / 名称（可改）",
+                    key="cb_voice_name",
+                    help=(
+                        "Edge：如 zh-CN-XiaoxiaoNeural；"
+                        "豆包：如 BV700_V2_streaming；"
+                        "克隆引擎：填参考音色 ID 或本地 wav 路径（视引擎约定）。"
+                    ),
+                )
+                r1, r2 = st.columns(2)
+                with r1:
+                    if "cb_voice_rate" not in st.session_state:
+                        st.session_state["cb_voice_rate"] = 1.0
+                    voice_rate = st.slider(
+                        "语速",
+                        min_value=0.7,
+                        max_value=1.4,
+                        step=0.05,
+                        key="cb_voice_rate",
+                        help="1.0 正常；偏快可塞进更短字幕槽。",
+                    )
+                with r2:
+                    if "cb_voice_pitch" not in st.session_state:
+                        st.session_state["cb_voice_pitch"] = 1.0
+                    voice_pitch = st.slider(
+                        "音调（Edge/Azure 有效）",
+                        min_value=0.8,
+                        max_value=1.2,
+                        step=0.05,
+                        key="cb_voice_pitch",
+                    )
+                st.info(
+                    "上传自定义音色 / 原片声线克隆：后续可做（参考音 wav + IndexTTS）。"
+                    " 当前请用上方引擎预设或手动填音色 ID。"
+                )
+
+                st.markdown("##### 分离与混音")
                 sep_labels = {
                     "auto": "自动（优先 demucs 真分离）",
                     "demucs": "强制 demucs 真分离",
                     "center_cancel": "立体声中置削弱（近似）",
                     "duck": "压低原声（保底）",
                 }
-                # demucs 可用时默认 auto；否则仍 auto（会降级）
                 separate_backend = st.selectbox(
                     "人声分离方式",
                     options=list(sep_labels.keys()),
@@ -506,19 +816,12 @@ def _render_create_form(tr):
                         key="cb_dub_vol",
                         help="默认 1.8，确保中文/目标语配音听得清。",
                     )
-                    gender_label = st.selectbox(
-                        "默认音色性别",
-                        options=["女声", "男声"],
-                        index=0,
-                        key="cb_voice_gender",
+                    sidechain_duck = st.checkbox(
+                        "人声出现时自动压低伴奏（sidechain）",
+                        value=True,
+                        key="cb_sidechain_duck",
+                        help="配音开口时伴奏略压，更像正式混音；关闭则两轨硬叠。",
                     )
-                    voice_gender = "male" if gender_label.startswith("男") else "female"
-                sidechain_duck = st.checkbox(
-                    "人声出现时自动压低伴奏（sidechain）",
-                    value=True,
-                    key="cb_sidechain_duck",
-                    help="配音开口时伴奏略压，更像正式混音；关闭则两轨硬叠。",
-                )
                 burn_after_mix = st.checkbox(
                     "混音后烧目标字幕",
                     value=True,
@@ -526,8 +829,8 @@ def _render_create_form(tr):
                     help="关闭则只导出配音视频（无硬字幕）。",
                 )
                 st.caption(
-                    "配音链路：识别 → 翻译 → 人声分离 → 目标语 TTS（音色强制对齐语种）"
-                    " → 伴奏混音 → 烧字幕。高级里可改目标语种，音色会自动匹配。"
+                    "链路：识别 → 翻译 → 人声分离 → 目标语 TTS → 伴奏混音 → 烧字幕。"
+                    " 背景音与配音并存；音色须对应目标语。"
                 )
 
             bilingual = st.checkbox(
@@ -683,14 +986,12 @@ def _render_create_form(tr):
         )
         asr_backend = "auto"
 
-    # 解说工厂专属
+    # 解说工厂专属（不要覆盖配音 expander 已写入的 voice_name / tts_engine）
     style_pack = DEFAULT_BY_DIRECTION[direction]
     duration_mode = "keep"
     original_audio_ratio = 30 if direction == "inbound" else 20
     source_credit = True
     credit_hint = ""
-    voice_name = "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
-    tts_engine = ""
     content_type = "tech_review"
     platform = "douyin" if direction == "inbound" else "tiktok"
     narration_word_count = 320 if direction == "inbound" else 150
@@ -699,6 +1000,11 @@ def _render_create_form(tr):
         source_lang, target_lang = "en", "zh"
     else:
         source_lang, target_lang = "zh", "en"
+    # 非配音模式才给默认音色；配音已在「④ 配音与字幕样式」里选好
+    if mode != "dubbing":
+        voice_name = "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
+        if mode != "narration":
+            tts_engine = tts_engine or ""
 
     if mode == "narration":
         style_map = style_choices_for_ui(direction)
@@ -769,7 +1075,7 @@ def _render_create_form(tr):
 
             lang_choices = voices_mod.lang_choices_for_ui()
             lang_codes = [c for c, _ in lang_choices]
-            # 目标语快捷选择（与 text_input 同步）
+            # 目标语快捷选择（音色控件已在上方 expander，这里只改语种）
             cur_tgt = (st.session_state.get("cb_target_lang") or target_lang or "en")[:2]
             try:
                 tgt_idx = lang_codes.index(cur_tgt)
@@ -781,35 +1087,22 @@ def _render_create_form(tr):
                 format_func=lambda i: lang_choices[i][1],
                 index=tgt_idx,
                 key="cb_target_lang_pick",
-                help="选择后会写入目标语言，并给出该语默认 Edge 音色。",
+                help="选择后会写入目标语言；上方「配音音色」预设会按新语种刷新。",
             )
             picked_lang = lang_codes[int(pick)]
             if st.session_state.get("cb_target_lang") != picked_lang:
                 st.session_state["cb_target_lang"] = picked_lang
                 target_lang = picked_lang
-            default_v = voices_mod.default_voice_for_lang(picked_lang, gender=voice_gender)
-            # 语种变化 → 强制换对应音色；音色与目标语不一致也自动纠正
-            prev_lang = st.session_state.get("cb_dub_voice_lang")
-            cur_voice = (st.session_state.get("cb_voice_name") or "").strip()
-            need_sync = prev_lang != picked_lang or not cur_voice
-            if not need_sync and cur_voice:
-                vlang = voices_mod.voice_lang(cur_voice)
-                if vlang and vlang != picked_lang:
-                    need_sync = True
-            if need_sync:
-                st.session_state["cb_voice_name"] = default_v
-                st.session_state["cb_dub_voice_lang"] = picked_lang
-            voice_name = st.text_input("TTS 音色（Edge，须对应目标语）", key="cb_voice_name")
-            tts_engine = st.selectbox(
-                "TTS 引擎",
-                options=["edge_tts", "azure_speech", "doubaotts", "tencent_tts", "qwen3_tts", ""],
-                format_func=lambda x: x or "跟随全局配置",
-                index=0,
-                key="cb_tts_engine_dub",
-            )
+                # 语种变了 → 下次渲染按新语重筛音色预设
+                st.session_state.pop("cb_voice_sync_key", None)
+            # 从 session 回读 expander 已选的音色/引擎（避免被默认值覆盖）
+            voice_name = (st.session_state.get("cb_voice_name") or voice_name or "").strip()
+            tts_engine = st.session_state.get("cb_tts_engine_dub", tts_engine)
+            voice_rate = float(st.session_state.get("cb_voice_rate") or voice_rate or 1.0)
+            voice_pitch = float(st.session_state.get("cb_voice_pitch") or voice_pitch or 1.0)
             st.caption(
-                f"默认音色：`{default_v}`。支持语种："
-                + " / ".join(voices_mod.SUPPORTED_LANGS)
+                f"当前配音：引擎 `{tts_engine or 'edge_tts'}` · 音色 `{voice_name or '-'}` · "
+                f"语速 {voice_rate:.2f}。可在上方「④ 配音与字幕样式」更换。"
             )
         if mode == "narration":
             asr_backend_label = st.selectbox(
@@ -922,6 +1215,8 @@ def _render_create_form(tr):
             asr_backend=asr_backend,
             voice_name=voice_name,
             tts_engine=tts_engine or ("edge_tts" if mode == "dubbing" else ""),
+            voice_rate=float(voice_rate if mode == "dubbing" else 1.0),
+            voice_pitch=float(voice_pitch if mode == "dubbing" else 1.0),
             task_name=(task_name or "").strip(),
             video_title=video_title,
             mode=mode,
@@ -1191,17 +1486,27 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
     if export_dir:
         st.caption(f"导出目录：`{export_dir}`")
 
+    # 实时字幕节点（ASR/翻译过程中可读盘增量 target.srt）
+    _render_live_subtitle_nodes(meta, running=running)
+
     with st.expander(
         "字幕预览 / 补齐", expanded=(mode in {"subtitle", "dubbing"})
     ):
         src = artifacts.get("source_srt") or ""
         tgt = artifacts.get("target_srt") or ""
+        # 运行中编辑器可能覆盖正在写入的 target；给出提示
+        if running and status in {"translate_running", "asr_running"}:
+            st.caption(
+                "生成中：上方「字幕节点」会实时刷新；下方编辑器保存会覆盖当前草稿，请待翻译完成后再改。"
+            )
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("**源字幕 (source.srt)**")
+            # 运行中从磁盘重读，避免 artifacts 路径尚未回写
+            src_path = _srt_path_for_task(meta, "source") or src
             st.text_area(
                 "source_preview",
-                value=task_store.read_text_artifact(src)[:4000] or "(空)",
+                value=task_store.read_text_artifact(src_path)[:4000] or "(空)",
                 height=180,
                 key="cb_src_preview",
                 disabled=True,
@@ -1235,9 +1540,14 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
             st.markdown("**目标字幕 (target.srt)**")
             # 可编辑目标字幕（字幕模式核心）
             editor_key = f"cb_tgt_editor_{task_id}"
-            if st.session_state.get("cb_tgt_editor_task") != task_id:
+            tgt_path = _srt_path_for_task(meta, "target") or tgt
+            # 翻译进行中不要用 session 缓存锁死旧内容：每次从磁盘刷新初值
+            if running and status == "translate_running":
+                st.session_state[editor_key] = task_store.read_text_artifact(tgt_path)
                 st.session_state["cb_tgt_editor_task"] = task_id
-                st.session_state[editor_key] = task_store.read_text_artifact(tgt)
+            elif st.session_state.get("cb_tgt_editor_task") != task_id:
+                st.session_state["cb_tgt_editor_task"] = task_id
+                st.session_state[editor_key] = task_store.read_text_artifact(tgt_path)
             edited_tgt = st.text_area(
                 "target_editor",
                 height=180,
