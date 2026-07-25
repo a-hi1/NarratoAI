@@ -512,6 +512,106 @@ def inject_global_css() -> None:
     import streamlit as st
 
     st.markdown(APP_CSS, unsafe_allow_html=True)
+    # Streamlit 1.x 在 tabs/复杂树 + rerun 时，浏览器偶发
+    # NotFoundError: removeChild（React DOM 差分竞态）。
+    # 不影响后台任务，但会弹红框；这里在父页面 patch 掉并隐藏该报错。
+    inject_removechild_guard()
+
+
+def inject_removechild_guard() -> None:
+    """
+    吞掉 Streamlit 前端 removeChild NotFoundError，避免红框吓人。
+    用 components.html 在 iframe 里改写 parent 的 Node.prototype。
+    每个 session 只注入一次，避免重复挂 observer。
+    """
+    import streamlit as st
+
+    if st.session_state.get("_na_removechild_guard"):
+        return
+    st.session_state["_na_removechild_guard"] = True
+    try:
+        import streamlit.components.v1 as components
+    except Exception:
+        return
+
+    # height=0 几乎不占位；script 跑在 iframe，通过 window.parent 改主页面
+    components.html(
+        """
+<script>
+(function () {
+  try {
+    var w = window.parent;
+    if (!w || w.__naRemoveChildPatched) return;
+    w.__naRemoveChildPatched = true;
+
+    var NodeProto = w.Node.prototype;
+    var origRemove = NodeProto.removeChild;
+    NodeProto.removeChild = function (child) {
+      if (child && child.parentNode !== this) {
+        return child;
+      }
+      try {
+        return origRemove.call(this, child);
+      } catch (e) {
+        if (
+          e &&
+          (e.name === "NotFoundError" ||
+            String(e.message || "").indexOf("removeChild") >= 0)
+        ) {
+          return child;
+        }
+        throw e;
+      }
+    };
+
+    function isRemoveChildNoise(text) {
+      if (!text) return false;
+      return (
+        text.indexOf("removeChild") >= 0 ||
+        (text.indexOf("NotFoundError") >= 0 &&
+          text.indexOf("Node") >= 0)
+      );
+    }
+
+    function hideNoiseOverlays() {
+      try {
+        var doc = w.document;
+        var candidates = doc.querySelectorAll(
+          '[data-testid="stException"], .stException, ' +
+            '[data-testid="stAlert"], [class*="stException"], ' +
+            'div[role="alert"]'
+        );
+        for (var i = 0; i < candidates.length; i++) {
+          var n = candidates[i];
+          var t = n.innerText || n.textContent || "";
+          if (isRemoveChildNoise(t)) {
+            n.style.setProperty("display", "none", "important");
+            n.setAttribute("data-na-hidden-removechild", "1");
+          }
+        }
+      } catch (_) {}
+    }
+
+    try {
+      var obs = new w.MutationObserver(function () {
+        hideNoiseOverlays();
+      });
+      if (w.document && w.document.body) {
+        obs.observe(w.document.body, { childList: true, subtree: true });
+      }
+      hideNoiseOverlays();
+      // 首屏延迟再扫一次，覆盖晚到的 error boundary
+      w.setTimeout(hideNoiseOverlays, 300);
+      w.setTimeout(hideNoiseOverlays, 1200);
+    } catch (_) {}
+  } catch (e) {
+    /* ignore */
+  }
+})();
+</script>
+        """,
+        height=0,
+    )
 
 
 def _resolve_logo_data_uri() -> str:

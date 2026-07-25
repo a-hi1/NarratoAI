@@ -1,6 +1,6 @@
 # NarratoAI 跨境本地化解说 — 项目介绍与开发接手提示词
 
-> 更新时间：2026-07-24  
+> 更新时间：2026-07-25  
 > 用途：新开 Claude / 开发会话时，把本文整段或「开发提示词」一节贴进去即可快速接手。
 
 ---
@@ -8,11 +8,12 @@
 ## 一、项目一句话
 
 **NarratoAI** 是开源的影视/短剧 AI 解说文案 + 自动剪辑工具（Streamlit WebUI）。  
-我们在其之上做二开：**跨境视频本地化**，支持 **en↔zh 双向**，两种模式：
+我们在其之上做二开：**跨境视频本地化**，支持 **en↔zh 双向**（配音模式可扩多语），三种模式：
 
 | 模式 | 路径 | 类比 |
 |------|------|------|
 | **subtitle（默认）** | ASR → 翻译 → 硬烧字幕 | [VideoLingo](https://github.com/Huanshere/VideoLingo) |
+| **dubbing（实验）** | ASR → 翻译 → 人声分离 → 目标语 TTS → 混音 → 烧字幕 | 多语配音 / 换声 |
 | **narration（高级）** | ASR → 翻译 → digest → 文案 → 匹配 → TTS → 成片 | 解说文案工厂 |
 
 | 方向 | 含义 | 典型场景 |
@@ -83,6 +84,20 @@ draft → queued
   ↘ failed（可从失败步重试）
 ```
 
+### 多语配音（mode=dubbing，实验）
+
+```
+draft → queued
+  → asr_running → asr_done
+  → translate_running → translate_done
+  → separate_running → separate_done   # demucs / center_cancel / duck
+  → dub_tts_running → dub_tts_done     # 目标字幕逐句 TTS → 时间轴
+  → mix_running → mix_done             # 伴奏 + 配音 → dubbed.mp4
+  → burn_running → burn_done           # 在 dubbed.mp4 上烧目标字幕
+  → completed
+  ↘ failed（可从失败步重试）
+```
+
 ### 解说文案工厂（mode=narration）
 
 ```
@@ -100,6 +115,7 @@ draft → queued
 ```
 
 - 字幕模式：后台默认跑完全程；可改 target.srt 后点「继续烧字幕」。
+- 配音模式：后台默认跑完全程；可改字幕后「继续配音」；详情可换音色重配 / 重分离 / 重混。
 - 解说模式：默认 `stop_after="copy"`，审核后再点「继续匹配成片」。
 - 任务落盘：`storage/tasks/cross_border/{task_id}/meta.json` + 各 artifact。
 - 后台：线程 + 文件轮询（避免 Streamlit 同步阻塞 / removeChild）。
@@ -110,16 +126,21 @@ draft → queued
 
 ```
 app/services/cross_border/
-  state_machine.py   # 状态转移、进度、HUMAN_GATES；steps_for_mode(subtitle|narration)
+  state_machine.py   # 状态转移、进度、HUMAN_GATES；steps_for_mode(subtitle|dubbing|narration)
   style_packs.py     # 6 套风格包（3 In + 3 Out）
   glossary.py        # 术语解析 / prompt 注入 / 锁定替换
   compliance.py      # OST 占比、改造度粗分
-  task_store.py      # create/load/save/list、artifact IO；mode/bilingual 字段
+  task_store.py      # create/load/save/list、artifact IO；mode/bilingual/dubbing 字段
   asr.py             # FunASR local/firered/bailian + whisper 回退
   burn.py            # 双语 SRT 合并 + 硬烧（复用 generate_video.merge_materials）
-  pipeline.py        # step_* + run_from + 后台线程（含 step_burn）
+  pipeline.py        # step_* + run_from + 后台线程（含 step_burn / separate / dub_tts / mix）
   render.py          # clip/merge 成片（解说模式）
   packaging.py       # 标题包装 + export bundle
+  dubbing/           # 多语配音独立模块
+    voices.py        # 多语 Edge 音色 + 语种白名单
+    separate.py      # demucs / center_cancel / duck 人声分离
+    synthesize.py    # 目标 SRT → 逐句 TTS → 时间轴音轨
+    mix.py           # 伴奏+配音混音、mux 回视频
   __init__.py
 
 app/services/prompts/cross_border_narration/
@@ -181,6 +202,29 @@ app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下
 - **原片硬字幕遮罩条（手动）**：`subtitle_mask_enabled` + `side`(bottom/top) + `height%` + `color`(black/translucent) + `subtitle_on_mask`；burn 时 ffmpeg `drawbox` 盖住原字幕区再烧译文（不识别、不擦除）
 - UI：新建默认电影字幕；详情「改样式后重烧」只重 burn
 - 默认编码器 `libx264`
+
+### 多语配音（mode=dubbing）要点
+
+链路：`asr → translate → separate → dub_tts → mix → burn`
+
+| 步骤 | 产物 | 说明 |
+|------|------|------|
+| separate | `audio/{source,vocals,no_vocals}.wav` | `auto`：优先 demucs 真分离 → center_cancel → duck |
+| dub_tts | `dub/dub_voice.wav` + `dub/tts_lines/*.mp3` | 读 `target.srt`；句级 atempo 拟合槽位 + 淡入淡出 |
+| mix | `dub/mixed.wav` + `dub/dubbed.mp4` | 人声压缩 + sidechain 压伴奏 + loudnorm -16 LUFS |
+| burn | `export/output.mp4` | **烧在 dubbed.mp4 上**（已换音轨） |
+
+- **人声分离（真分离已可用）**：venv 已装 `torch 2.13+cpu` + `demucs 4.1`。`auto` 优先 demucs。CPU 较慢；首次会下载 htdemucs 模型。
+  - 重装：`pip install torch --index-url https://download.pytorch.org/whl/cpu` 再 `pip install demucs`
+- **语种-音色对齐**：`resolve_voice_for_lang` 强制 Edge 音色与目标语一致（错配自动换成该语默认声）
+- **配音质感**：句级 atempo 拟合字幕槽 + 淡入淡出 + 尾部 pad；混音 sidechain + 压缩 + loudnorm
+- **混音默认音量（重要）**：伴奏 `0.55` / 配音 `1.8`。旧默认 0.9/1.15 会把中文 TTS 盖成「只有背景音」。
+  - sidechain 必须用 `asplit` 分叉人声标签，不能同一 `[vc]` 既喂 sidechain 又 amix
+  - 旧任务重混时若仍是 0.9/1.15，pipeline 会自动抬到 0.55/1.8
+- **多语**：`dubbing/voices.py` 内置 15 语默认 Edge 音色；UI 高级可快捷选目标语
+- **inputs 字段**：`separate_backend` / `duck_gain` / `instrumental_volume` / `dub_voice_volume` / `voice_gender` / `burn_after_mix` / `sidechain_duck`
+- **UI**：新建「多语配音（实验）」；详情可换音色重配 / 重分离 / 重混
+- **限制（已知）**：CPU demucs 慢；sidechain 依赖 ffmpeg；TTS 句数默认截断 200；翻译质量仍偏 en↔zh
 
 ---
 

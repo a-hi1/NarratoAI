@@ -230,13 +230,21 @@ def create_task(
     subtitle_mask_color: str = "black",
     subtitle_mask_height_percent: float = 14.0,
     subtitle_on_mask: bool = True,
+    # dubbing 模式
+    separate_backend: str = "auto",
+    duck_gain: float = 0.18,
+    instrumental_volume: float = 0.55,
+    dub_voice_volume: float = 1.8,
+    voice_gender: str = "female",
+    burn_after_mix: bool = True,
+    sidechain_duck: bool = True,
 ) -> Dict[str, Any]:
     direction = (direction or "inbound").lower()
     if direction not in {"inbound", "outbound"}:
         raise ValueError("direction must be inbound or outbound")
 
     mode = (mode or "subtitle").strip().lower()
-    if mode not in {"subtitle", "narration"}:
+    if mode not in {"subtitle", "narration", "dubbing"}:
         mode = "subtitle"
 
     if direction == "inbound":
@@ -331,6 +339,18 @@ def create_task(
             or "black",
             "subtitle_mask_height_percent": float(subtitle_mask_height_percent or 14.0),
             "subtitle_on_mask": bool(subtitle_on_mask),
+            # dubbing
+            "separate_backend": (separate_backend or "auto").strip().lower() or "auto",
+            "duck_gain": float(duck_gain if duck_gain is not None else 0.18),
+            "instrumental_volume": float(
+                instrumental_volume if instrumental_volume is not None else 0.55
+            ),
+            "dub_voice_volume": float(
+                dub_voice_volume if dub_voice_volume is not None else 1.8
+            ),
+            "voice_gender": (voice_gender or "female").strip().lower() or "female",
+            "burn_after_mix": bool(burn_after_mix),
+            "sidechain_duck": bool(sidechain_duck),
         },
         "artifacts": {
             "source_srt": "",
@@ -346,6 +366,15 @@ def create_task(
             "description": "",
             "compliance": "",
             "export_dir": artifact_path(task_id, "export"),
+            # dubbing artifacts
+            "source_wav": "",
+            "vocals_wav": "",
+            "no_vocals_wav": "",
+            "dub_voice_wav": "",
+            "mixed_wav": "",
+            "dubbed_mp4": "",
+            "separate_backend": "",
+            "dub_tts_meta": "",
         },
         "error": None,
         "logs": [],
@@ -415,6 +444,9 @@ def transition(meta: Dict[str, Any], target_status: str, error: Optional[str] = 
 
 def write_text_artifact(task_id: str, filename: str, content: str) -> str:
     path = artifact_path(task_id, filename)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content or "")
     return path
@@ -422,6 +454,9 @@ def write_text_artifact(task_id: str, filename: str, content: str) -> str:
 
 def write_json_artifact(task_id: str, filename: str, data: Any) -> str:
     path = artifact_path(task_id, filename)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path

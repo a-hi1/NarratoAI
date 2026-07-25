@@ -6,9 +6,10 @@
 
 状态流转面向 Streamlit 轮询：pipeline 写文件，UI 只读 status/progress。
 
-两种业务模式：
+三种业务模式：
 - subtitle（默认，仿 VideoLingo）：asr → translate → burn → completed
 - narration（解说文案工厂）：asr → … → packaging → completed
+- dubbing（多语配音）：asr → translate → separate → dub_tts → mix → burn → completed
 """
 
 from __future__ import annotations
@@ -39,11 +40,23 @@ SUBTITLE_STEPS: Tuple[str, ...] = (
     "burn",
 )
 
+# 多语配音：保留画面 + 替换人声（可烧目标字幕）
+DUBBING_STEPS: Tuple[str, ...] = (
+    "asr",
+    "translate",
+    "separate",
+    "dub_tts",
+    "mix",
+    "burn",
+)
+
 # 兼容旧代码：默认指解说步骤全集；真正跑流水线时按 mode 选
 PIPELINE_STEPS: Tuple[str, ...] = NARRATION_STEPS
 
 ALL_PIPELINE_STEPS: Tuple[str, ...] = tuple(
-    dict.fromkeys(list(NARRATION_STEPS) + list(SUBTITLE_STEPS))
+    dict.fromkeys(
+        list(NARRATION_STEPS) + list(SUBTITLE_STEPS) + list(DUBBING_STEPS)
+    )
 )
 
 
@@ -51,6 +64,8 @@ def steps_for_mode(mode: str) -> Tuple[str, ...]:
     mode = (mode or "subtitle").strip().lower()
     if mode == "narration":
         return NARRATION_STEPS
+    if mode == "dubbing":
+        return DUBBING_STEPS
     return SUBTITLE_STEPS
 
 
@@ -93,12 +108,13 @@ for i, step in enumerate(NARRATION_STEPS):
                 }
             )
         elif step == "translate":
-            # 字幕模式：translate 后可进 burn；解说模式：进 digest
+            # 字幕：burn；解说：digest；配音：separate
             _TRANSITIONS[done] = frozenset(
                 {
                     running,
                     next_running,
                     _running("burn"),
+                    _running("separate"),
                     "failed",
                     "cancelled",
                 }
@@ -111,10 +127,41 @@ for i, step in enumerate(NARRATION_STEPS):
         # packaging_done
         _TRANSITIONS[done] = frozenset({"completed", "failed", "cancelled", running})
 
-# burn 步骤（字幕本地化）
+# burn 步骤（字幕本地化 / 配音后烧字幕）
 _TRANSITIONS[_running("burn")] = frozenset({_done("burn"), "failed", "cancelled"})
 _TRANSITIONS[_done("burn")] = frozenset(
     {"completed", _running("burn"), "failed", "cancelled"}
+)
+
+# dubbing 专属步骤
+for _dstep in ("separate", "dub_tts", "mix"):
+    _TRANSITIONS[_running(_dstep)] = frozenset(
+        {_done(_dstep), "failed", "cancelled"}
+    )
+
+_TRANSITIONS[_done("separate")] = frozenset(
+    {
+        _running("separate"),
+        _running("dub_tts"),
+        "failed",
+        "cancelled",
+    }
+)
+_TRANSITIONS[_done("dub_tts")] = frozenset(
+    {
+        _running("dub_tts"),
+        _running("mix"),
+        "failed",
+        "cancelled",
+    }
+)
+_TRANSITIONS[_done("mix")] = frozenset(
+    {
+        _running("mix"),
+        _running("burn"),
+        "failed",
+        "cancelled",
+    }
 )
 
 _TRANSITIONS["completed"] = frozenset(
@@ -123,6 +170,9 @@ _TRANSITIONS["completed"] = frozenset(
         _running("render"),
         _running("packaging"),
         _running("burn"),  # 重烧字幕
+        _running("separate"),  # 重做人声分离
+        _running("dub_tts"),  # 换配音音色
+        _running("mix"),
         "cancelled",
     }
 )
@@ -143,6 +193,13 @@ _PROGRESS: Dict[str, int] = {
     # 字幕模式
     "burn_running": 75,
     "burn_done": 95,
+    # 配音模式
+    "separate_running": 58,
+    "separate_done": 65,
+    "dub_tts_running": 72,
+    "dub_tts_done": 80,
+    "mix_running": 88,
+    "mix_done": 92,
     # 解说模式
     "digest_running": 45,
     "digest_done": 50,
@@ -163,11 +220,14 @@ _PROGRESS: Dict[str, int] = {
 
 
 HUMAN_GATES: Dict[str, str] = {
-    "translate_done": "可改源/目标字幕后重跑翻译，或继续烧字幕 / 摘要",
+    "translate_done": "可改源/目标字幕后重跑翻译，或继续烧字幕 / 摘要 / 配音",
     "copy_done": "必经审核点：修改解说文案后继续匹配",
     "match_done": "可改片段 narration/OST 后重跑 TTS/成片",
+    "separate_done": "人声分离完成；可重跑分离或继续配音 TTS",
+    "dub_tts_done": "配音音轨已生成；可换音色重跑或继续混音",
+    "mix_done": "混音完成；可继续烧字幕成片",
     "burn_done": "字幕成片已生成，可重烧或导出",
-    "completed": "可重导出 / 重烧字幕 / 换音色只重跑 tts+render",
+    "completed": "可重导出 / 重烧字幕 / 换音色只重跑 tts+render / 重配音",
 }
 
 

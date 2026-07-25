@@ -1063,16 +1063,265 @@ def step_packaging(meta: Dict[str, Any]) -> Dict[str, Any]:
     return transition(meta, "completed")
 
 
+def step_separate(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    配音模式：人声/伴奏分离。
+    demucs 可选；不可用时 center_cancel / duck 自动降级。
+    """
+    from .dubbing import separate as separate_mod
+
+    meta = transition(meta, "separate_running")
+    task_id = meta["task_id"]
+    inputs = meta.get("inputs") or {}
+    artifacts = meta.setdefault("artifacts", {})
+    video_path = inputs.get("video_path") or ""
+    if not video_path or not os.path.isfile(video_path):
+        return _set_failed(meta, "video missing before separate", step="separate")
+
+    audio_dir = artifact_path(task_id, "audio")
+    backend = str(inputs.get("separate_backend") or "auto")
+    duck_gain = float(inputs.get("duck_gain") if inputs.get("duck_gain") is not None else 0.18)
+
+    try:
+        result = separate_mod.separate_audio(
+            video_path,
+            audio_dir,
+            backend=backend,
+            duck_gain=duck_gain,
+        )
+    except Exception as exc:
+        logger.exception("separate failed")
+        return _set_failed(meta, f"separate failed: {exc}", step="separate")
+
+    artifacts["source_wav"] = result.get("source_wav") or ""
+    artifacts["vocals_wav"] = result.get("vocals_wav") or ""
+    artifacts["no_vocals_wav"] = result.get("no_vocals_wav") or ""
+    artifacts["separate_backend"] = result.get("backend") or backend
+    inputs["separate_backend_used"] = result.get("backend") or backend
+    write_json_artifact(
+        task_id,
+        "separate.json",
+        {
+            "backend": result.get("backend"),
+            "demucs_available": result.get("demucs_available"),
+            "note": result.get("note"),
+            "source_wav": result.get("source_wav"),
+            "vocals_wav": result.get("vocals_wav"),
+            "no_vocals_wav": result.get("no_vocals_wav"),
+        },
+    )
+    append_log(
+        meta,
+        f"separate backend={result.get('backend')} note={result.get('note')}",
+        level="WARNING" if result.get("backend") != "demucs" else "INFO",
+    )
+    save_meta(meta)
+    return transition(meta, "separate_done")
+
+
+def step_dub_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """配音模式：目标字幕逐句 TTS → 时间轴配音轨。"""
+    from .dubbing import mix as mix_mod
+    from .dubbing import synthesize as synth_mod
+    from .dubbing.voices import normalize_lang, resolve_voice_for_lang
+
+    meta = transition(meta, "dub_tts_running")
+    task_id = meta["task_id"]
+    inputs = meta.get("inputs") or {}
+    artifacts = meta.setdefault("artifacts", {})
+    target_srt = artifacts.get("target_srt") or artifact_path(task_id, "target.srt")
+    if not os.path.isfile(target_srt) or os.path.getsize(target_srt) < 5:
+        return _set_failed(meta, "target.srt missing/empty before dub_tts", step="dub_tts")
+
+    srt_text = read_text_artifact(target_srt)
+    work_dir = artifact_path(task_id, "dub")
+    video_path = inputs.get("video_path") or ""
+    total_dur = 0.0
+    if video_path and os.path.isfile(video_path):
+        total_dur = mix_mod.probe_duration_seconds(video_path)
+    if total_dur <= 0 and artifacts.get("source_wav"):
+        total_dur = mix_mod.probe_duration_seconds(artifacts["source_wav"])
+
+    lang = normalize_lang(meta.get("target_lang") or inputs.get("target_lang") or "en")
+    gender = str(inputs.get("voice_gender") or "female")
+    raw_voice = (inputs.get("voice_name") or "").strip()
+    voice_name, voice_corrected = resolve_voice_for_lang(
+        lang, raw_voice, gender=gender, force_match=True
+    )
+    voice_rate = float(inputs.get("voice_rate") or 1.0)
+    voice_pitch = float(inputs.get("voice_pitch") or 1.0)
+    tts_engine = (inputs.get("tts_engine") or "edge_tts").strip() or "edge_tts"
+
+    try:
+        result = synth_mod.synthesize_from_srt(
+            srt_text,
+            work_dir,
+            target_lang=lang,
+            voice_name=voice_name,
+            voice_rate=voice_rate,
+            voice_pitch=voice_pitch,
+            tts_engine=tts_engine,
+            total_duration=total_dur,
+            voice_gender=gender,
+            force_voice_lang_match=True,
+        )
+    except Exception as exc:
+        logger.exception("dub_tts failed")
+        return _set_failed(meta, f"dub_tts failed: {exc}", step="dub_tts")
+
+    artifacts["dub_voice_wav"] = result.get("timeline_wav") or ""
+    artifacts["tts_dir"] = result.get("tts_dir") or ""
+    artifacts["dub_tts_meta"] = artifact_path(task_id, "dub/tts_meta.json")
+    # segments 可能很大，只落关键字段
+    write_json_artifact(
+        task_id,
+        "dub/tts_meta.json",
+        {
+            "voice_name": result.get("voice_name"),
+            "voice_corrected": bool(result.get("voice_corrected") or voice_corrected),
+            "target_lang": result.get("target_lang"),
+            "segment_count": result.get("segment_count"),
+            "cue_count": result.get("cue_count"),
+            "timeline_wav": result.get("timeline_wav"),
+            "total_duration": result.get("total_duration"),
+            "segments": [
+                {
+                    "id": s.get("id"),
+                    "start": s.get("start"),
+                    "end": s.get("end"),
+                    "duration": s.get("duration"),
+                    "slot": s.get("slot"),
+                    "text": s.get("text"),
+                    "audio_file": s.get("audio_file"),
+                }
+                for s in (result.get("segments") or [])
+            ],
+        },
+    )
+    inputs["voice_name"] = result.get("voice_name") or voice_name
+    if result.get("voice_corrected") or voice_corrected:
+        append_log(
+            meta,
+            f"voice auto-matched to target_lang={lang}: {raw_voice or '(empty)'} → {inputs['voice_name']}",
+            level="WARNING",
+        )
+    append_log(
+        meta,
+        f"dub_tts voice={result.get('voice_name')} lang={result.get('target_lang')} "
+        f"segments={result.get('segment_count')}/{result.get('cue_count')}",
+    )
+    save_meta(meta)
+    return transition(meta, "dub_tts_done")
+
+
+def step_mix(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """配音模式：伴奏 + 配音混音，回贴到视频（尚不烧字幕）。"""
+    from .dubbing import mix as mix_mod
+
+    meta = transition(meta, "mix_running")
+    task_id = meta["task_id"]
+    inputs = meta.get("inputs") or {}
+    artifacts = meta.setdefault("artifacts", {})
+    video_path = inputs.get("video_path") or ""
+    no_vocals = artifacts.get("no_vocals_wav") or artifact_path(task_id, "audio/no_vocals.wav")
+    dub_voice = artifacts.get("dub_voice_wav") or artifact_path(task_id, "dub/dub_voice.wav")
+
+    if not video_path or not os.path.isfile(video_path):
+        return _set_failed(meta, "video missing before mix", step="mix")
+    if not os.path.isfile(no_vocals):
+        return _set_failed(meta, "no_vocals.wav missing before mix", step="mix")
+    if not os.path.isfile(dub_voice):
+        return _set_failed(meta, "dub_voice.wav missing before mix", step="mix")
+
+    mixed_wav = artifact_path(task_id, "dub/mixed.wav")
+    # 默认配音压过伴奏：旧任务 0.9/1.15 实测会被 BGM 盖住
+    iv = float(
+        inputs.get("instrumental_volume")
+        if inputs.get("instrumental_volume") is not None
+        else 0.55
+    )
+    vv = float(
+        inputs.get("dub_voice_volume")
+        if inputs.get("dub_voice_volume") is not None
+        else 1.8
+    )
+    # 兼容旧任务：若仍是偏弱默认，自动抬配音、压伴奏
+    try:
+        if abs(iv - 0.9) < 1e-6 and abs(vv - 1.15) < 1e-6:
+            iv, vv = 0.55, 1.8
+            append_log(
+                meta,
+                "auto-boost dub mix levels (legacy 0.9/1.15 → 0.55/1.8)",
+                level="WARNING",
+            )
+    except Exception:
+        pass
+    # 默认开启 sidechain：人声出现时压低伴奏，更贴片
+    sidechain = inputs.get("sidechain_duck")
+    if sidechain is None:
+        sidechain = True
+    try:
+        mix_mod.mix_instrumental_and_voice(
+            instrumental_wav=no_vocals,
+            voice_wav=dub_voice,
+            output_wav=mixed_wav,
+            instrumental_volume=iv,
+            voice_volume=vv,
+            sidechain_duck=bool(sidechain),
+        )
+        dubbed_mp4 = artifact_path(task_id, "dub/dubbed.mp4")
+        mix_mod.mux_video_with_audio(
+            video_path=video_path,
+            audio_path=mixed_wav,
+            output_mp4=dubbed_mp4,
+        )
+    except Exception as exc:
+        logger.exception("mix failed")
+        return _set_failed(meta, f"mix failed: {exc}", step="mix")
+
+    if not os.path.isfile(dubbed_mp4) or os.path.getsize(dubbed_mp4) < 1000:
+        return _set_failed(meta, "mix produced empty dubbed.mp4", step="mix")
+
+    artifacts["mixed_wav"] = mixed_wav
+    artifacts["dubbed_mp4"] = dubbed_mp4
+    # 若后续不烧字幕，也把 dubbed 当作成片
+    if not bool(inputs.get("burn_after_mix", True)):
+        export_dir = artifact_path(task_id, "export")
+        os.makedirs(export_dir, exist_ok=True)
+        output_mp4 = os.path.join(export_dir, "output.mp4")
+        try:
+            shutil.copy2(dubbed_mp4, output_mp4)
+            artifacts["output_mp4"] = output_mp4
+            artifacts["export_dir"] = export_dir
+        except OSError as exc:
+            append_log(meta, f"copy dubbed to export failed: {exc}", level="WARNING")
+            artifacts["output_mp4"] = dubbed_mp4
+
+    append_log(meta, f"mixed audio → {dubbed_mp4}")
+    save_meta(meta)
+    meta = transition(meta, "mix_done")
+    if not bool(inputs.get("burn_after_mix", True)):
+        return transition(meta, "completed")
+    return meta
+
+
 def step_burn(meta: Dict[str, Any]) -> Dict[str, Any]:
     """
-    VideoLingo 风格：原片 + 目标字幕 → 硬烧成片（保留原声）。
+    VideoLingo 风格：视频 + 目标字幕 → 硬烧成片。
+    字幕模式：原片 + 原声；配音模式：优先用混音后的 dubbed.mp4。
     可选双语：目标在上 / 源在下。
     """
     meta = transition(meta, "burn_running")
     task_id = meta["task_id"]
     inputs = meta.get("inputs") or {}
     artifacts = meta.setdefault("artifacts", {})
-    video_path = inputs.get("video_path") or ""
+    mode = _task_mode(meta)
+    # 配音模式烧在已替换音轨的视频上
+    video_path = ""
+    if mode == "dubbing":
+        video_path = artifacts.get("dubbed_mp4") or ""
+    if not video_path or not os.path.isfile(video_path):
+        video_path = inputs.get("video_path") or ""
     target_srt = artifacts.get("target_srt") or artifact_path(task_id, "target.srt")
     source_srt = artifacts.get("source_srt") or artifact_path(task_id, "source.srt")
 
@@ -1144,13 +1393,16 @@ STEP_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "render": step_render,
     "packaging": step_packaging,
     "burn": step_burn,
+    "separate": step_separate,
+    "dub_tts": step_dub_tts,
+    "mix": step_mix,
 }
 
 
 def _task_mode(meta: Dict[str, Any]) -> str:
     mode = (meta.get("mode") or (meta.get("inputs") or {}).get("mode") or "subtitle")
     mode = str(mode).strip().lower()
-    return mode if mode in {"subtitle", "narration"} else "subtitle"
+    return mode if mode in {"subtitle", "narration", "dubbing"} else "subtitle"
 
 
 def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional[str] = None) -> Dict[str, Any]:
@@ -1159,6 +1411,7 @@ def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional
     按 meta.mode 选择步骤链：
       - subtitle（默认）：asr → translate → burn → completed
       - narration：asr → … → packaging → completed
+      - dubbing：asr → translate → separate → dub_tts → mix → burn → completed
     解说模式若要在 copy 人工卡点，请 stop_after='copy'。
     """
     mode = _task_mode(meta)
@@ -1236,6 +1489,7 @@ def start_task_background(
     """
     后台线程跑 pipeline。
     - subtitle 模式默认跑完全程（asr→translate→burn）
+    - dubbing 模式默认跑完全程（asr→…→mix→burn）
     - narration 模式默认停在 copy（人工审文案）；显式传 stop_after=None 跑完全程
     返回 False 表示已有线程在跑。
     """
@@ -1289,5 +1543,22 @@ def continue_after_copy(task_id: str) -> bool:
 
 
 def continue_after_translate(task_id: str) -> bool:
-    """字幕模式：审核字幕后从 burn 跑到结束。"""
+    """字幕/配音：审核字幕后继续。字幕→burn；配音→separate。"""
+    try:
+        meta = load_meta(task_id)
+        mode = _task_mode(meta)
+    except Exception:
+        mode = "subtitle"
+    if mode == "dubbing":
+        return start_task_background(task_id, start_step="separate", stop_after=None)
     return start_task_background(task_id, start_step="burn", stop_after=None)
+
+
+def continue_after_separate(task_id: str) -> bool:
+    """配音模式：从 dub_tts 跑到结束。"""
+    return start_task_background(task_id, start_step="dub_tts", stop_after=None)
+
+
+def rerun_dub_tts(task_id: str) -> bool:
+    """配音模式：换音色后从 dub_tts 重跑到结束。"""
+    return start_task_background(task_id, start_step="dub_tts", stop_after=None)

@@ -83,6 +83,30 @@ class StateMachineTests(unittest.TestCase):
         )
         self.assertEqual(state_machine.steps_for_mode("subtitle"), ("asr", "translate", "burn"))
         self.assertIn("burn", state_machine.ALL_PIPELINE_STEPS)
+        self.assertEqual(
+            state_machine.steps_for_mode("dubbing"),
+            ("asr", "translate", "separate", "dub_tts", "mix", "burn"),
+        )
+        self.assertEqual(
+            state_machine.next_running_after("translate_done", mode="dubbing"),
+            "separate_running",
+        )
+        self.assertEqual(
+            state_machine.next_running_after("mix_done", mode="dubbing"),
+            "burn_running",
+        )
+        self.assertEqual(
+            state_machine.next_running_after("burn_done", mode="dubbing"),
+            "completed",
+        )
+        state_machine.assert_transition("translate_done", "separate_running")
+        state_machine.assert_transition("separate_done", "dub_tts_running")
+        state_machine.assert_transition("dub_tts_done", "mix_running")
+        state_machine.assert_transition("mix_done", "burn_running")
+        state_machine.assert_transition("completed", "dub_tts_running")
+        self.assertIn("separate", state_machine.ALL_PIPELINE_STEPS)
+        self.assertIn("dub_tts", state_machine.ALL_PIPELINE_STEPS)
+        self.assertIn("mix", state_machine.ALL_PIPELINE_STEPS)
 
     def test_failed_retry(self):
         state_machine.assert_transition("failed", "digest_running")
@@ -1115,6 +1139,175 @@ class UrlDownloadHelperTests(unittest.TestCase):
             self.assertFalse(result["transcoded"])
             self.assertEqual(result["extractor"], "fake")
 
+
+class DubbingModuleTests(unittest.TestCase):
+    def test_voices_normalize_and_defaults(self):
+        from app.services.cross_border.dubbing import voices as voices_mod
+
+        self.assertEqual(voices_mod.normalize_lang("zh-CN"), "zh")
+        self.assertEqual(voices_mod.normalize_lang("EN_us"), "en")
+        self.assertEqual(voices_mod.normalize_lang("xx", fallback="ja"), "ja")
+        self.assertTrue(voices_mod.default_voice_for_lang("ja").startswith("ja-"))
+        self.assertIn("Guy", voices_mod.default_voice_for_lang("en", gender="male"))
+        codes = [c for c, _ in voices_mod.lang_choices_for_ui()]
+        self.assertIn("zh", codes)
+        self.assertIn("ko", codes)
+        # 音色必须对应目标语：中文目标 + 英文音色 → 纠正
+        v, corrected = voices_mod.resolve_voice_for_lang(
+            "zh", "en-US-JennyNeural", gender="female"
+        )
+        self.assertTrue(corrected)
+        self.assertTrue(v.startswith("zh-"))
+        v2, c2 = voices_mod.resolve_voice_for_lang(
+            "en", "en-US-JennyNeural", gender="female"
+        )
+        self.assertFalse(c2)
+        self.assertEqual(v2, "en-US-JennyNeural")
+        self.assertEqual(voices_mod.voice_lang("ja-JP-NanamiNeural"), "ja")
+
+    def test_parse_srt_cues(self):
+        from app.services.cross_border.dubbing import synthesize as synth_mod
+
+        text = (
+            "1\n00:00:00,000 --> 00:00:01,500\nHello\n\n"
+            "2\n00:00:02,000 --> 00:00:03,000\nWorld\nline2\n"
+        )
+        cues = synth_mod.parse_srt_cues(text)
+        self.assertEqual(len(cues), 2)
+        self.assertEqual(cues[0]["text"], "Hello")
+        self.assertEqual(cues[1]["text"], "World line2")
+        self.assertAlmostEqual(cues[0]["end"], 1.5)
+        self.assertEqual(synth_mod.parse_srt_cues(""), [])
+
+    def test_create_task_dubbing_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="outbound",
+                    video_path=os.path.join(tmp, "a.mp4"),
+                    mode="dubbing",
+                    target_lang="ja",
+                    separate_backend="duck",
+                    duck_gain=0.2,
+                    voice_gender="male",
+                    burn_after_mix=True,
+                )
+                self.assertEqual(meta["mode"], "dubbing")
+                self.assertEqual(meta["inputs"]["mode"], "dubbing")
+                self.assertEqual(meta["inputs"]["separate_backend"], "duck")
+                self.assertAlmostEqual(meta["inputs"]["duck_gain"], 0.2)
+                self.assertEqual(meta["inputs"]["voice_gender"], "male")
+                self.assertTrue(meta["inputs"]["burn_after_mix"])
+                self.assertIn("dubbed_mp4", meta["artifacts"])
+
+    def test_dubbing_pipeline_handlers_mocked(self):
+        from app.services.cross_border import pipeline as cb_pipeline
+
+        sample_srt = (
+            "1\n00:00:00,000 --> 00:00:02,000\n你好世界\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\n第二句\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "demo.mp4")
+            with open(video_path, "wb") as f:
+                f.write(b"\x00" * 2048)
+            with mock.patch.object(task_store, "tasks_root", return_value=tmp):
+                meta = task_store.create_task(
+                    direction="outbound",
+                    video_path=video_path,
+                    mode="dubbing",
+                    target_lang="en",
+                    separate_backend="duck",
+                )
+                srt_path = task_store.artifact_path(meta["task_id"], "source.srt")
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(sample_srt)
+                meta["artifacts"]["source_srt"] = srt_path
+                task_store.save_meta(meta)
+
+                def fake_separate(m):
+                    m = task_store.transition(m, "separate_running")
+                    audio_dir = task_store.artifact_path(m["task_id"], "audio")
+                    os.makedirs(audio_dir, exist_ok=True)
+                    for name in ("source.wav", "vocals.wav", "no_vocals.wav"):
+                        p = os.path.join(audio_dir, name)
+                        with open(p, "wb") as f:
+                            f.write(b"RIFF" + b"\x00" * 100)
+                        m["artifacts"][name.replace(".wav", "_wav")] = p
+                    m["artifacts"]["separate_backend"] = "duck"
+                    task_store.save_meta(m)
+                    return task_store.transition(m, "separate_done")
+
+                def fake_dub_tts(m):
+                    m = task_store.transition(m, "dub_tts_running")
+                    dub_dir = task_store.artifact_path(m["task_id"], "dub")
+                    os.makedirs(dub_dir, exist_ok=True)
+                    voice = os.path.join(dub_dir, "dub_voice.wav")
+                    with open(voice, "wb") as f:
+                        f.write(b"RIFF" + b"\x00" * 100)
+                    m["artifacts"]["dub_voice_wav"] = voice
+                    task_store.save_meta(m)
+                    return task_store.transition(m, "dub_tts_done")
+
+                def fake_mix(m):
+                    m = task_store.transition(m, "mix_running")
+                    dub_dir = task_store.artifact_path(m["task_id"], "dub")
+                    os.makedirs(dub_dir, exist_ok=True)
+                    mixed = os.path.join(dub_dir, "mixed.wav")
+                    dubbed = os.path.join(dub_dir, "dubbed.mp4")
+                    with open(mixed, "wb") as f:
+                        f.write(b"RIFF" + b"\x00" * 100)
+                    with open(dubbed, "wb") as f:
+                        f.write(b"\x00" * 2048)
+                    m["artifacts"]["mixed_wav"] = mixed
+                    m["artifacts"]["dubbed_mp4"] = dubbed
+                    task_store.save_meta(m)
+                    return task_store.transition(m, "mix_done")
+
+                def fake_burn(m):
+                    m = task_store.transition(m, "burn_running")
+                    out = os.path.join(
+                        task_store.artifact_path(m["task_id"], "export"), "output.mp4"
+                    )
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    with open(out, "wb") as f:
+                        f.write(b"\x00" * 2048)
+                    m["artifacts"]["output_mp4"] = out
+                    task_store.save_meta(m)
+                    m = task_store.transition(m, "burn_done")
+                    return task_store.transition(m, "completed")
+
+                with mock.patch.object(
+                    cb_pipeline,
+                    "step_translate",
+                    side_effect=lambda m: _fake_translate(m, sample_srt),
+                ), mock.patch.object(
+                    cb_pipeline, "step_separate", side_effect=fake_separate
+                ), mock.patch.object(
+                    cb_pipeline, "step_dub_tts", side_effect=fake_dub_tts
+                ), mock.patch.object(
+                    cb_pipeline, "step_mix", side_effect=fake_mix
+                ), mock.patch.object(
+                    cb_pipeline, "step_burn", side_effect=fake_burn
+                ):
+                    result = cb_pipeline.run_from(
+                        task_store.load_meta(meta["task_id"]),
+                        start_step="asr",
+                        stop_after=None,
+                    )
+
+                self.assertEqual(
+                    result["status"],
+                    "completed",
+                    msg=f"error={result.get('error')} logs={result.get('logs')[-8:]}",
+                )
+                self.assertEqual(result.get("mode"), "dubbing")
+                self.assertTrue(
+                    os.path.isfile(result["artifacts"].get("output_mp4") or "")
+                )
+                self.assertTrue(
+                    os.path.isfile(result["artifacts"].get("dubbed_mp4") or "")
+                )
 
 
 if __name__ == "__main__":
