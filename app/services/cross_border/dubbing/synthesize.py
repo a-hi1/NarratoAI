@@ -9,7 +9,13 @@
 - 按字幕槽 atempo 伸缩（支持级联，范围约 0.25–4.0）
 - 过短句尾部补静音，避免句间空洞感不一致
 - 句首/句尾短淡入淡出，降低拼接咔哒声
-- 分批 amix，支持更长片（默认 200 句）
+- 分批 amix，支持长片（默认最多 2000 句）
+
+长视频加速：
+- 网络 TTS 有限并发（Edge 默认 3）
+- 已存在 mp3 可复用
+- fit 阶段并行 ffmpeg
+- 放开 200 句硬截断
 """
 
 from __future__ import annotations
@@ -30,8 +36,9 @@ _TIME_LINE = re.compile(
 )
 
 # 单批 amix 输入上限（ffmpeg 滤镜图复杂度）
-_BATCH_SIZE = 40
-_MAX_SEGMENTS = 200
+_BATCH_SIZE = 48
+# 长片默认上限；可用 CROSS_BORDER_TTS_MAX_SEGMENTS 覆盖
+_MAX_SEGMENTS = 2000
 # 逐句 TTS 默认并发；Edge/豆包等网络 TTS 收益最大。可用环境变量覆盖。
 _DEFAULT_TTS_WORKERS = 4
 
@@ -101,6 +108,16 @@ def parse_srt_cues(text: str) -> List[Dict[str, Any]]:
     return cues
 
 
+def _max_segments() -> int:
+    raw = (os.environ.get("CROSS_BORDER_TTS_MAX_SEGMENTS") or "").strip()
+    if raw:
+        try:
+            return max(50, min(10000, int(raw)))
+        except ValueError:
+            pass
+    return _MAX_SEGMENTS
+
+
 def _tts_one(
     text: str,
     out_path: str,
@@ -163,13 +180,20 @@ def _audio_duration(path: str) -> float:
             return max(0.05, float((r.stdout or "0").strip() or 0))
     except Exception:
         pass
+    # mp3 粗估：128kbps ≈ 16KB/s
+    try:
+        size = os.path.getsize(path)
+        if size > 200:
+            return max(0.2, size / 16000.0)
+    except OSError:
+        pass
     return 1.0
 
 
 def _tts_worker_count(engine: str = "") -> int:
     """
     网络 TTS 适合有限并发；本地克隆默认串行。
-    Edge 并发过高易触发 NoAudioReceived/限流，默认 2；豆包等云端默认 4。
+    Edge 并发过高易触发 NoAudioReceived/限流，默认 3；豆包等云端默认 4。
     可用 CROSS_BORDER_TTS_WORKERS 覆盖。
     """
     raw = (os.environ.get("CROSS_BORDER_TTS_WORKERS") or "").strip()
@@ -177,7 +201,8 @@ def _tts_worker_count(engine: str = "") -> int:
     if eng in {"indextts", "indextts2", "omnivoice", "soulvoice", "voxcpm"}:
         default = 1
     elif eng in {"edge_tts", "edge", "azure_speech", "azure"}:
-        default = 2
+        # 3 比 2 明显更快；仍低于易触发限流的 4+
+        default = 3
     else:
         default = _DEFAULT_TTS_WORKERS
     if not raw:
@@ -187,6 +212,22 @@ def _tts_worker_count(engine: str = "") -> int:
     except ValueError:
         n = default
     return max(1, min(16, n))
+
+
+def _fit_worker_count() -> int:
+    raw = (os.environ.get("CROSS_BORDER_TTS_FIT_WORKERS") or "").strip()
+    try:
+        cpu = os.cpu_count() or 4
+    except Exception:
+        cpu = 4
+    default = min(6, max(2, cpu // 3))
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        n = default
+    return max(1, min(12, n))
 
 
 def synthesize_cues_to_dir(
@@ -252,23 +293,30 @@ def synthesize_cues_to_dir(
     )
 
     results: List[Dict[str, Any]] = []
+    done = 0
     if n_workers <= 1 or len(jobs) <= 1:
         for job in jobs:
             row = _run_one(job)
+            done += 1
             if row:
                 results.append(row)
+            if done % 25 == 0 or done == len(jobs):
+                logger.info(f"dub TTS progress {done}/{len(jobs)}")
     else:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futs = {pool.submit(_run_one, job): job["id"] for job in jobs}
             for fut in as_completed(futs):
                 cid = futs[fut]
+                done += 1
                 try:
                     row = fut.result()
                 except Exception as exc:
                     logger.warning(f"skip cue {cid}: tts worker error: {exc}")
-                    continue
+                    row = None
                 if row:
                     results.append(row)
+                if done % 25 == 0 or done == len(jobs):
+                    logger.info(f"dub TTS progress {done}/{len(jobs)}")
 
     results.sort(key=lambda r: int(r["id"]))
     reused = sum(1 for r in results if r.get("reused"))
@@ -315,6 +363,19 @@ def _fit_segment_file(
     """
     slot = max(0.12, float(slot))
     duration = max(0.05, float(duration))
+    if (
+        os.path.isfile(dst)
+        and os.path.getsize(dst) > 200
+        and abs(os.path.getmtime(dst) - os.path.getmtime(src)) < 86400 * 7
+    ):
+        # 已 fit 过且源未明显更新：复用
+        try:
+            if os.path.getmtime(dst) >= os.path.getmtime(src) - 1:
+                real = _audio_duration(dst)
+                return dst, real, 1.0
+        except OSError:
+            pass
+
     fade = min(0.04, slot * 0.08, duration * 0.15)
     filters: List[str] = []
     tempo_used = 1.0
@@ -476,7 +537,7 @@ def build_timeline_audio(
 ) -> str:
     """
     按 start 时间把各句 TTS 铺到一条音轨。
-    先逐句 fit 到字幕槽，再分批 amix，最后合并。
+    先逐句 fit 到字幕槽（并行），再分批 amix，最后合并。
     """
     os.makedirs(os.path.dirname(output_wav) or ".", exist_ok=True)
     total_duration = max(1.0, float(total_duration or 1.0))
@@ -497,16 +558,18 @@ def build_timeline_audio(
         subprocess.run(cmd, capture_output=True, timeout=120)
         return output_wav
 
-    if len(segments) > _MAX_SEGMENTS:
+    max_seg = _max_segments()
+    if len(segments) > max_seg:
         logger.warning(
-            f"dub tts segments truncated {_MAX_SEGMENTS}/{len(segments)} for stability"
+            f"dub tts segments truncated {max_seg}/{len(segments)} for stability "
+            f"(set CROSS_BORDER_TTS_MAX_SEGMENTS to raise)"
         )
-        segments = segments[:_MAX_SEGMENTS]
+        segments = segments[:max_seg]
 
     fit_dir = work_dir or os.path.join(os.path.dirname(output_wav) or ".", "tts_fit")
     os.makedirs(fit_dir, exist_ok=True)
-    fitted: List[Dict[str, Any]] = []
-    for seg in segments:
+
+    def _fit_one(seg: Dict[str, Any]) -> Dict[str, Any]:
         src = seg["audio_file"]
         dst = os.path.join(fit_dir, f"fit_{int(seg['id']):04d}.wav")
         path, out_dur, tempo = _fit_segment_file(
@@ -515,14 +578,41 @@ def build_timeline_audio(
             slot=float(seg.get("slot") or 1.0),
             duration=float(seg.get("duration") or 1.0),
         )
-        fitted.append(
-            {
-                **seg,
-                "audio_file": path,
-                "duration": out_dur,
-                "tempo": tempo,
-            }
-        )
+        return {
+            **seg,
+            "audio_file": path,
+            "duration": out_dur,
+            "tempo": tempo,
+        }
+
+    n_fit = _fit_worker_count()
+    n_fit = max(1, min(n_fit, len(segments)))
+    logger.info(f"dub fit: {len(segments)} segments, workers={n_fit}")
+    fitted: List[Dict[str, Any]] = []
+    if n_fit <= 1 or len(segments) <= 1:
+        for seg in segments:
+            fitted.append(_fit_one(seg))
+    else:
+        with ThreadPoolExecutor(max_workers=n_fit) as pool:
+            futs = {pool.submit(_fit_one, seg): int(seg["id"]) for seg in segments}
+            by_id: Dict[int, Dict[str, Any]] = {}
+            done = 0
+            for fut in as_completed(futs):
+                cid = futs[fut]
+                done += 1
+                try:
+                    by_id[cid] = fut.result()
+                except Exception as exc:
+                    logger.warning(f"fit segment {cid} failed: {exc}")
+                if done % 40 == 0 or done == len(segments):
+                    logger.info(f"dub fit progress {done}/{len(segments)}")
+        for seg in segments:
+            row = by_id.get(int(seg["id"]))
+            if row:
+                fitted.append(row)
+
+    if not fitted:
+        raise RuntimeError("all fit segments failed")
 
     if len(fitted) <= _BATCH_SIZE:
         return _mix_batch(fitted, output_wav, total_duration=total_duration)
@@ -531,6 +621,10 @@ def build_timeline_audio(
     for bi in range(0, len(fitted), _BATCH_SIZE):
         chunk = fitted[bi : bi + _BATCH_SIZE]
         bp = os.path.join(fit_dir, f"batch_{bi // _BATCH_SIZE:02d}.wav")
+        logger.info(
+            f"dub amix batch {bi // _BATCH_SIZE + 1}/"
+            f"{(len(fitted) + _BATCH_SIZE - 1) // _BATCH_SIZE} size={len(chunk)}"
+        )
         _mix_batch(chunk, bp, total_duration=total_duration)
         batch_paths.append(bp)
     return _merge_wavs(batch_paths, output_wav, total_duration=total_duration)

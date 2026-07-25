@@ -13,6 +13,11 @@
 - audio/source.wav
 - audio/vocals.wav（可能是占位/近似）
 - audio/no_vocals.wav（伴奏或压低后的底噪）
+
+长视频加速：
+- 复用已有 source.wav / stems，避免重复抽轨与重跑 demucs
+- CPU 上默认提高 -j；可用 CROSS_BORDER_DEMUCS_JOBS / DEVICE 覆盖
+- 超长片可设 CROSS_BORDER_DEMUCS_SEGMENT（秒）降低峰值内存
 """
 
 from __future__ import annotations
@@ -55,9 +60,25 @@ def demucs_available() -> bool:
         return False
 
 
-def extract_wav(video_path: str, wav_path: str, *, sample_rate: int = 44100) -> str:
+def _wav_ok(path: str, *, min_bytes: int = 1000) -> bool:
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) >= min_bytes
+    except OSError:
+        return False
+
+
+def extract_wav(
+    video_path: str,
+    wav_path: str,
+    *,
+    sample_rate: int = 44100,
+    reuse_existing: bool = True,
+) -> str:
     if not video_path or not os.path.isfile(video_path):
         raise SeparateError(f"video missing: {video_path}")
+    if reuse_existing and _wav_ok(wav_path, min_bytes=8000):
+        logger.info(f"reuse existing source wav: {wav_path}")
+        return wav_path
     os.makedirs(os.path.dirname(wav_path) or ".", exist_ok=True)
     cmd = [
         _ffmpeg(),
@@ -81,33 +102,39 @@ def extract_wav(video_path: str, wav_path: str, *, sample_rate: int = 44100) -> 
         errors="replace",
         timeout=600,
     )
-    if r.returncode != 0 or not os.path.isfile(wav_path) or os.path.getsize(wav_path) < 1000:
+    if r.returncode != 0 or not _wav_ok(wav_path):
         raise SeparateError(f"extract wav failed: {(r.stderr or r.stdout or '')[-500:]}")
     return wav_path
 
 
-def _run_demucs(source_wav: str, out_dir: str) -> Dict[str, str]:
-    """调用 demucs CLI/API；返回 vocals / no_vocals 路径。"""
-    # 使用 demucs 命令行更稳（避免版本 API 差）
-    work = os.path.join(out_dir, "_demucs_work")
-    if os.path.isdir(work):
-        shutil.rmtree(work, ignore_errors=True)
-    os.makedirs(work, exist_ok=True)
-    # 优先用当前解释器；CPU 上控制 jobs，避免把机器打满又几乎不加速
-    import sys
-
+def _demucs_jobs() -> int:
     try:
         cpu = os.cpu_count() or 2
     except Exception:
         cpu = 2
-    # demucs -j 是加载/处理并行；CPU 上 1–2 往往更稳，可用环境变量覆盖
+    # 20 核机器默认 4；过高会内存炸，可用环境变量覆盖
     jobs_raw = (os.environ.get("CROSS_BORDER_DEMUCS_JOBS") or "").strip()
     try:
-        jobs = int(jobs_raw) if jobs_raw else min(2, max(1, cpu // 2))
+        jobs = int(jobs_raw) if jobs_raw else min(4, max(2, cpu // 4))
     except ValueError:
-        jobs = 1
-    jobs = max(1, min(4, jobs))
+        jobs = 2
+    return max(1, min(8, jobs))
 
+
+def _run_demucs(source_wav: str, out_dir: str) -> Dict[str, str]:
+    """调用 demucs CLI；返回 vocals / no_vocals 路径。"""
+    work = os.path.join(out_dir, "_demucs_work")
+    # 不删已有 work：长片中断后可能已有部分输出；若 stems 完整则直接用
+    dest_v = os.path.join(out_dir, "vocals.wav")
+    dest_i = os.path.join(out_dir, "no_vocals.wav")
+    if _wav_ok(dest_v, min_bytes=8000) and _wav_ok(dest_i, min_bytes=8000):
+        logger.info("reuse existing demucs stems (vocals/no_vocals)")
+        return {"vocals": dest_v, "no_vocals": dest_i, "backend": "demucs"}
+
+    os.makedirs(work, exist_ok=True)
+    import sys
+
+    jobs = _demucs_jobs()
     cmd = [
         sys.executable,
         "-m",
@@ -126,7 +153,18 @@ def _run_demucs(source_wav: str, out_dir: str) -> Dict[str, str]:
     device = (os.environ.get("CROSS_BORDER_DEMUCS_DEVICE") or "").strip()
     if device:
         cmd.extend(["-d", device])
-    logger.info(f"demucs start jobs={jobs} device={device or 'auto'} file={source_wav}")
+    # 长片可分段降低峰值内存：CROSS_BORDER_DEMUCS_SEGMENT=8~12
+    segment = (os.environ.get("CROSS_BORDER_DEMUCS_SEGMENT") or "").strip()
+    if segment:
+        try:
+            seg_i = max(4, min(60, int(float(segment))))
+            cmd.extend(["--segment", str(seg_i)])
+        except ValueError:
+            pass
+    logger.info(
+        f"demucs start jobs={jobs} device={device or 'auto'} "
+        f"segment={segment or 'default'} file={source_wav}"
+    )
     r = subprocess.run(
         cmd,
         capture_output=True,
@@ -151,8 +189,6 @@ def _run_demucs(source_wav: str, out_dir: str) -> Dict[str, str]:
                 no_vocals = path
     if not vocals or not no_vocals:
         raise SeparateError("demucs finished but stems not found")
-    dest_v = os.path.join(out_dir, "vocals.wav")
-    dest_i = os.path.join(out_dir, "no_vocals.wav")
     shutil.copy2(vocals, dest_v)
     shutil.copy2(no_vocals, dest_i)
     shutil.rmtree(work, ignore_errors=True)
@@ -161,7 +197,6 @@ def _run_demucs(source_wav: str, out_dir: str) -> Dict[str, str]:
 
 def _center_cancel(source_wav: str, no_vocals_path: str) -> str:
     """立体声中置削弱：L-R 差作为伴奏近似（对人声居中的混音有效）。"""
-    # 输出仍为立体声：把 mono 差信号复制到双声道
     filt = (
         "pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c0-0.5*c1,"
         "volume=1.6"
@@ -249,6 +284,7 @@ def separate_audio(
     *,
     backend: str = "auto",
     duck_gain: float = 0.18,
+    reuse_existing: bool = True,
 ) -> Dict[str, Any]:
     """
     从视频分离人声/伴奏。
@@ -257,16 +293,40 @@ def separate_audio(
       - auto: demucs → center_cancel → duck
       - demucs / center_cancel / duck: 强制
     duck_gain: duck 模式下原声保留比例（0~1）
+    reuse_existing: 已有 stems 则跳过重算（长片重试必备）
     """
     os.makedirs(audio_dir, exist_ok=True)
     source_wav = os.path.join(audio_dir, "source.wav")
     vocals_path = os.path.join(audio_dir, "vocals.wav")
     no_vocals_path = os.path.join(audio_dir, "no_vocals.wav")
 
-    extract_wav(video_path, source_wav)
     backend = (backend or "auto").strip().lower()
     used = backend
     note = ""
+
+    # 已有完整 stems：直接复用（不区分 backend，避免长片 demucs 重跑）
+    if (
+        reuse_existing
+        and _wav_ok(vocals_path, min_bytes=8000)
+        and _wav_ok(no_vocals_path, min_bytes=8000)
+    ):
+        if not _wav_ok(source_wav, min_bytes=8000) and video_path:
+            try:
+                extract_wav(video_path, source_wav, reuse_existing=True)
+            except Exception:
+                pass
+        logger.info(f"reuse existing stems in {audio_dir}")
+        return {
+            "source_wav": source_wav if _wav_ok(source_wav) else "",
+            "vocals_wav": vocals_path,
+            "no_vocals_wav": no_vocals_path,
+            "backend": "cached",
+            "demucs_available": demucs_available(),
+            "note": "reused existing vocals/no_vocals stems",
+            "reused": True,
+        }
+
+    extract_wav(video_path, source_wav, reuse_existing=reuse_existing)
 
     def _try_demucs() -> bool:
         if not demucs_available():
@@ -314,4 +374,5 @@ def separate_audio(
         "backend": used,
         "demucs_available": demucs_available(),
         "note": note,
+        "reused": False,
     }

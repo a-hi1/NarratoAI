@@ -20,17 +20,18 @@ _TIME_LINE = re.compile(
 )
 
 # 预设：用户可在 UI 选。key 稳定，写入 meta.inputs.subtitle_style
-# 默认 cinema = 电影字幕（小、贴底、不抢画面）
+# 默认 cinema = 电影字幕（更小、贴底、尽量不挡画面）
 STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
     "cinema": {
-        "label": "电影字幕（推荐）",
+        "label": "电影字幕（推荐·更小）",
         "subtitle_color": "#FFFFFF",
         "stroke_color": "#000000",
-        "stroke_width_scale": 0.55,
+        "stroke_width_scale": 0.48,
         "shadow": 0,
         "border_style": 1,
         "back_colour": None,
-        "size_scale": 1.0,
+        # 相对 auto 基准再略缩，观感更接近院线字幕
+        "size_scale": 0.90,
     },
     "clean": {
         "label": "干净白字",
@@ -84,21 +85,21 @@ STYLE_PRESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# 字号档位：相对 auto 的倍率（auto 已是电影级小字）
+# 字号档位：相对 auto 的倍率（auto 基准已偏小，方便看画面）
 SIZE_PRESETS: Dict[str, float] = {
     "auto": 1.0,
-    "small": 0.88,
-    "medium": 1.12,
-    "large": 1.28,
+    "small": 0.82,
+    "medium": 1.10,
+    "large": 1.26,
 }
 
 # 位置：ASS Alignment + MarginV 占画面高比例
 # bottom 默认紧贴底边安全区，字小 + 边距小 = 不抢画面
 POSITION_PRESETS: Dict[str, Dict[str, Any]] = {
-    "bottom": {"align": 2, "margin_v_ratio": 0.024, "y_percent": None},
-    "bottom_high": {"align": 2, "margin_v_ratio": 0.07, "y_percent": None},
+    "bottom": {"align": 2, "margin_v_ratio": 0.018, "y_percent": None},
+    "bottom_high": {"align": 2, "margin_v_ratio": 0.06, "y_percent": None},
     "center": {"align": 5, "margin_v_ratio": 0.0, "y_percent": 50.0},
-    "top": {"align": 8, "margin_v_ratio": 0.035, "y_percent": None},
+    "top": {"align": 8, "margin_v_ratio": 0.03, "y_percent": None},
 }
 
 # 原片硬字幕遮罩条：手动勾选，不依赖识别
@@ -372,10 +373,10 @@ def adaptive_style(
     """
     按分辨率算字号 / 描边 / 底部边距。
 
-    默认电影字幕（偏小、贴底、舒服）：
-    - 1080p 横屏约 22px（≈2% 屏高）
-    - 竖屏 608 约 16px
-    不挡主体，需要时才看得到。
+    默认电影字幕（更小、贴底、方便看画面）：
+    - 1080p 横屏 cinema 约 17–18px（≈1.6% 屏高）
+    - 竖屏 608 cinema 约 12–13px
+    需要更大时在 UI 选 medium/large 或「干净白字」。
     """
     w = max(0, int(video_width or 0))
     h = max(0, int(video_height or 0))
@@ -396,33 +397,33 @@ def adaptive_style(
         font_size = int(font_size_override)
     else:
         if is_portrait:
-            # 竖屏：短边 / 38 → 608≈16，1080≈28 → 夹到 14–26
-            base = short / 38.0
+            # 竖屏：短边 / 46 → 608≈13.2，1080≈23.5 → 夹到 12–22
+            base = short / 46.0
             font_size = int(round(base * size_scale))
-            font_size = max(14, min(26, font_size))
+            font_size = max(12, min(22, font_size))
         else:
-            # 横屏：高度 / 48 → 720≈15，1080≈22.5，1440≈30，2160≈45→夹 32
-            base = h / 48.0
+            # 横屏：高度 / 56 → 720≈12.9，1080≈19.3，1440≈25.7，2160≈38.6→夹 28
+            base = h / 56.0
             font_size = int(round(base * size_scale))
-            font_size = max(14, min(32, font_size))
+            font_size = max(12, min(28, font_size))
         if bilingual:
             # 双语两行更占高，再略缩
-            font_size = max(13, int(round(font_size * 0.88)))
+            font_size = max(11, int(round(font_size * 0.86)))
 
     # 极细描边：小字配细边，避免发糊发胖
-    stroke_base = max(0.5, min(1.4, font_size / 28.0))
+    stroke_base = max(0.4, min(1.2, font_size / 30.0))
     stroke_width = round(stroke_base * float(preset.get("stroke_width_scale") or 1.0), 1)
-    stroke_width = max(0.5, min(1.6, stroke_width))
+    stroke_width = max(0.4, min(1.4, stroke_width))
 
     pos = POSITION_PRESETS.get(position_key) or POSITION_PRESETS["bottom"]
-    # 贴底：默认约 2.4% 屏高；双语略加大避免两行贴边被裁
-    margin_ratio = float(pos["margin_v_ratio"] or 0.024)
-    margin_v = max(10, int(round(h * margin_ratio)))
+    # 贴底：默认约 1.8% 屏高；双语略加大避免两行贴边被裁
+    margin_ratio = float(pos["margin_v_ratio"] or 0.018)
+    margin_v = max(8, int(round(h * margin_ratio)))
     if bilingual and position_key in {"bottom", "bottom_high"}:
-        margin_v = max(margin_v, int(round(h * 0.036)))
+        margin_v = max(margin_v, int(round(h * 0.03)))
 
-    # 左右边距：按宽度约 4.5%，给自动换行留气口，避免顶满左右
-    margin_lr = max(24, min(80, int(round(w * 0.045))))
+    # 左右边距：按宽度约 5%，给自动换行留气口，避免顶满左右
+    margin_lr = max(28, min(90, int(round(w * 0.05))))
 
     # 兼容旧 custom_position 语义（0–100 从上到下）
     if pos.get("y_percent") is not None:

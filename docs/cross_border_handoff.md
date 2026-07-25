@@ -193,12 +193,12 @@ app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下
 - `CROSS_BORDER_WHISPER_BEAM=1..5`（默认 1）
 - `CROSS_BORDER_WHISPER_COMPUTE=int8|float16`
 
-烧录样式（`burn.py`，默认**电影字幕**）：
-- 自适应字号：横屏 `h/48`（1080p≈22），竖屏 `short/38`（约 16）；更小、贴底、细描边
-- 左右边距约 4.5% 宽，避免顶满；底部 MarginV 约 2.4% 高
+烧录样式（`burn.py`，默认**电影字幕·更小**）：
+- 自适应字号：横屏 `h/56`（1080p≈19，cinema×0.9≈17），竖屏 `short/46`（608≈13）；更小、贴底、细描边
+- 左右边距约 5% 宽；底部 MarginV 约 1.8% 高
 - 默认预设 `cinema`；另有 `clean` / `netflix` / `soft` / `boxed` / `yellow`
 - 位置：`bottom` / `bottom_high` / `center` / `top`
-- 字号档：`auto` / `small` / `medium` / `large` / 手动
+- 字号档：`auto` / `small`(0.82) / `medium` / `large` / 手动
 - **原片硬字幕遮罩条（手动）**：`subtitle_mask_enabled` + `side`(bottom/top) + `height%` + `color`(black/translucent) + `subtitle_on_mask`；burn 时 ffmpeg `drawbox` 盖住原字幕区再烧译文（不识别、不擦除）
 - UI：新建默认电影字幕；详情「改样式后重烧」只重 burn
 - 默认编码器 `libx264`
@@ -224,11 +224,15 @@ app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下
 - **混音默认音量（重要）**：伴奏 `0.55` / 配音 `1.8`。旧默认 0.9/1.15 会把中文 TTS 盖成「只有背景音」。
   - sidechain 必须用 `asplit` 分叉人声标签，不能同一 `[vc]` 既喂 sidechain 又 amix
   - 旧任务重混时若仍是 0.9/1.15，pipeline 会自动抬到 0.55/1.8
-- **速度**：
-  - `dub_tts`：Edge/Azure 默认 **2 路**（过高易限流），豆包等云端默认 **4 路**，本地克隆默认串行。环境变量 `CROSS_BORDER_TTS_WORKERS=1..16`
-  - 已生成的 `dub/tts_lines/*.mp3` **可复用**，卡住重跑不会从头合成
-  - demucs CPU 默认 `-j 1~2`；`CROSS_BORDER_DEMUCS_JOBS` / `CROSS_BORDER_DEMUCS_DEVICE=cpu|cuda`
-  - 只要背景、可接受轻微残留人声：新建时分离方式改 `center_cancel` 或 `duck`（秒级，比 demucs 快一个数量级）
+- **速度（长片重点）**：
+  - **`separate` ∥ `dub_tts` 并行**（默认开）：wall-clock ≈ max(分离, 配音)。`CROSS_BORDER_DUB_PARALLEL=0` 可关
+  - `dub_tts`：Edge/Azure 默认 **3 路**（过高易限流），豆包等云端默认 **4 路**，本地克隆串行。`CROSS_BORDER_TTS_WORKERS=1..16`
+  - 句数上限默认 **2000**（旧 200 会截长片）；`CROSS_BORDER_TTS_MAX_SEGMENTS`
+  - fit 阶段并行 ffmpeg：`CROSS_BORDER_TTS_FIT_WORKERS`（默认约 cpu/3，≤6）
+  - 已生成 `dub/tts_lines/*.mp3`、已 fit 的 wav、已有 `vocals/no_vocals` **可复用**
+  - demucs CPU 默认 `-j≈cpu/4`（上限 4）；`CROSS_BORDER_DEMUCS_JOBS` / `CROSS_BORDER_DEMUCS_DEVICE=cpu|cuda` / `CROSS_BORDER_DEMUCS_SEGMENT`
+  - 混音默认 `dynaudnorm`（比 loudnorm 快）；要经典响度归一设 `CROSS_BORDER_MIX_LOUDNORM=1`
+  - **17 分钟+ 真分离在 CPU 上仍可能 30–90 分钟**：要快可选 `center_cancel` / `duck`（秒～分钟级）
 - **多语**：`dubbing/voices.py` 内置 15 语默认 Edge 音色 + 引擎/预设列表（Edge 中英日韩、豆包 BV*）
 - **inputs 字段**：`separate_backend` / `duck_gain` / `instrumental_volume` / `dub_voice_volume` / `voice_gender` / `burn_after_mix` / `sidechain_duck` / `tts_engine` / `voice_name` / `voice_rate` / `voice_pitch`
 - **UI**：新建「多语配音」展开 **④ 配音与字幕样式**（引擎/性别/预设/音色 ID/语速音调/分离混音）；高级只改目标语种；详情可换音色重配 / 重分离 / 重混

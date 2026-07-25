@@ -1103,41 +1103,22 @@ def step_packaging(meta: Dict[str, Any]) -> Dict[str, Any]:
     return transition(meta, "completed")
 
 
-def step_separate(meta: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    配音模式：人声/伴奏分离。
-    demucs 可选；不可用时 center_cancel / duck 自动降级。
-    """
-    from .dubbing import separate as separate_mod
-
-    meta = transition(meta, "separate_running")
+def _apply_separate_result(
+    meta: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    backend_fallback: str = "auto",
+) -> Dict[str, Any]:
+    """把 separate_audio 结果写回 meta/artifacts。"""
     task_id = meta["task_id"]
-    inputs = meta.get("inputs") or {}
+    inputs = meta.setdefault("inputs", {})
     artifacts = meta.setdefault("artifacts", {})
-    video_path = inputs.get("video_path") or ""
-    if not video_path or not os.path.isfile(video_path):
-        return _set_failed(meta, "video missing before separate", step="separate")
-
-    audio_dir = artifact_path(task_id, "audio")
-    backend = str(inputs.get("separate_backend") or "auto")
-    duck_gain = float(inputs.get("duck_gain") if inputs.get("duck_gain") is not None else 0.18)
-
-    try:
-        result = separate_mod.separate_audio(
-            video_path,
-            audio_dir,
-            backend=backend,
-            duck_gain=duck_gain,
-        )
-    except Exception as exc:
-        logger.exception("separate failed")
-        return _set_failed(meta, f"separate failed: {exc}", step="separate")
-
     artifacts["source_wav"] = result.get("source_wav") or ""
     artifacts["vocals_wav"] = result.get("vocals_wav") or ""
     artifacts["no_vocals_wav"] = result.get("no_vocals_wav") or ""
-    artifacts["separate_backend"] = result.get("backend") or backend
-    inputs["separate_backend_used"] = result.get("backend") or backend
+    used = result.get("backend") or backend_fallback
+    artifacts["separate_backend"] = used
+    inputs["separate_backend_used"] = used
     write_json_artifact(
         task_id,
         "separate.json",
@@ -1145,16 +1126,113 @@ def step_separate(meta: Dict[str, Any]) -> Dict[str, Any]:
             "backend": result.get("backend"),
             "demucs_available": result.get("demucs_available"),
             "note": result.get("note"),
+            "reused": bool(result.get("reused")),
             "source_wav": result.get("source_wav"),
             "vocals_wav": result.get("vocals_wav"),
             "no_vocals_wav": result.get("no_vocals_wav"),
         },
     )
+    level = "INFO"
+    if used not in {"demucs", "cached"}:
+        level = "WARNING"
     append_log(
         meta,
-        f"separate backend={result.get('backend')} note={result.get('note')}",
-        level="WARNING" if result.get("backend") != "demucs" else "INFO",
+        f"separate backend={used} note={result.get('note')}"
+        + (" (reused stems)" if result.get("reused") else ""),
+        level=level,
     )
+    return meta
+
+
+def _apply_dub_tts_result(
+    meta: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    raw_voice: str = "",
+    voice_corrected: bool = False,
+    lang: str = "",
+) -> Dict[str, Any]:
+    """把 synthesize_from_srt 结果写回 meta/artifacts。"""
+    task_id = meta["task_id"]
+    inputs = meta.setdefault("inputs", {})
+    artifacts = meta.setdefault("artifacts", {})
+    artifacts["dub_voice_wav"] = result.get("timeline_wav") or ""
+    artifacts["tts_dir"] = result.get("tts_dir") or ""
+    artifacts["dub_tts_meta"] = artifact_path(task_id, "dub/tts_meta.json")
+    write_json_artifact(
+        task_id,
+        "dub/tts_meta.json",
+        {
+            "voice_name": result.get("voice_name"),
+            "voice_corrected": bool(result.get("voice_corrected") or voice_corrected),
+            "target_lang": result.get("target_lang"),
+            "segment_count": result.get("segment_count"),
+            "cue_count": result.get("cue_count"),
+            "timeline_wav": result.get("timeline_wav"),
+            "total_duration": result.get("total_duration"),
+            "segments": [
+                {
+                    "id": s.get("id"),
+                    "start": s.get("start"),
+                    "end": s.get("end"),
+                    "duration": s.get("duration"),
+                    "slot": s.get("slot"),
+                    "text": s.get("text"),
+                    "audio_file": s.get("audio_file"),
+                }
+                for s in (result.get("segments") or [])
+            ],
+        },
+    )
+    inputs["voice_name"] = result.get("voice_name") or inputs.get("voice_name") or ""
+    if result.get("voice_corrected") or voice_corrected:
+        append_log(
+            meta,
+            f"voice auto-matched to target_lang={lang}: {raw_voice or '(empty)'} → {inputs['voice_name']}",
+            level="WARNING",
+        )
+    append_log(
+        meta,
+        f"dub_tts voice={result.get('voice_name')} lang={result.get('target_lang')} "
+        f"segments={result.get('segment_count')}/{result.get('cue_count')}",
+    )
+    return meta
+
+
+def step_separate(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    配音模式：人声/伴奏分离。
+    demucs 可选；不可用时 center_cancel / duck 自动降级。
+    已有 stems 会复用，避免长片重跑。
+    """
+    from .dubbing import separate as separate_mod
+
+    meta = transition(meta, "separate_running")
+    task_id = meta["task_id"]
+    inputs = meta.get("inputs") or {}
+    video_path = inputs.get("video_path") or ""
+    if not video_path or not os.path.isfile(video_path):
+        return _set_failed(meta, "video missing before separate", step="separate")
+
+    audio_dir = artifact_path(task_id, "audio")
+    backend = str(inputs.get("separate_backend") or "auto")
+    duck_gain = float(inputs.get("duck_gain") if inputs.get("duck_gain") is not None else 0.18)
+    append_log(meta, f"separate start backend={backend}")
+    save_meta(meta)
+
+    try:
+        result = separate_mod.separate_audio(
+            video_path,
+            audio_dir,
+            backend=backend,
+            duck_gain=duck_gain,
+            reuse_existing=True,
+        )
+    except Exception as exc:
+        logger.exception("separate failed")
+        return _set_failed(meta, f"separate failed: {exc}", step="separate")
+
+    meta = _apply_separate_result(meta, result, backend_fallback=backend)
     save_meta(meta)
     return transition(meta, "separate_done")
 
@@ -1215,49 +1293,203 @@ def step_dub_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
         logger.exception("dub_tts failed")
         return _set_failed(meta, f"dub_tts failed: {exc}", step="dub_tts")
 
-    artifacts["dub_voice_wav"] = result.get("timeline_wav") or ""
-    artifacts["tts_dir"] = result.get("tts_dir") or ""
-    artifacts["dub_tts_meta"] = artifact_path(task_id, "dub/tts_meta.json")
-    # segments 可能很大，只落关键字段
-    write_json_artifact(
-        task_id,
-        "dub/tts_meta.json",
-        {
-            "voice_name": result.get("voice_name"),
-            "voice_corrected": bool(result.get("voice_corrected") or voice_corrected),
-            "target_lang": result.get("target_lang"),
-            "segment_count": result.get("segment_count"),
-            "cue_count": result.get("cue_count"),
-            "timeline_wav": result.get("timeline_wav"),
-            "total_duration": result.get("total_duration"),
-            "segments": [
-                {
-                    "id": s.get("id"),
-                    "start": s.get("start"),
-                    "end": s.get("end"),
-                    "duration": s.get("duration"),
-                    "slot": s.get("slot"),
-                    "text": s.get("text"),
-                    "audio_file": s.get("audio_file"),
-                }
-                for s in (result.get("segments") or [])
-            ],
-        },
-    )
-    inputs["voice_name"] = result.get("voice_name") or voice_name
-    if result.get("voice_corrected") or voice_corrected:
-        append_log(
-            meta,
-            f"voice auto-matched to target_lang={lang}: {raw_voice or '(empty)'} → {inputs['voice_name']}",
-            level="WARNING",
-        )
-    append_log(
+    meta = _apply_dub_tts_result(
         meta,
-        f"dub_tts voice={result.get('voice_name')} lang={result.get('target_lang')} "
-        f"segments={result.get('segment_count')}/{result.get('cue_count')}",
+        result,
+        raw_voice=raw_voice,
+        voice_corrected=voice_corrected,
+        lang=lang,
     )
     save_meta(meta)
     return transition(meta, "dub_tts_done")
+
+
+def step_separate_and_dub_tts(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    长片加速：人声分离(CPU demucs) 与 目标语 TTS 并行。
+    二者无数据依赖；mix 前再汇合。
+
+    可用 CROSS_BORDER_DUB_PARALLEL=0 强制串行（调试）。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from .dubbing import mix as mix_mod
+    from .dubbing import separate as separate_mod
+    from .dubbing import synthesize as synth_mod
+    from .dubbing.voices import normalize_lang, resolve_voice_for_lang
+
+    disable = (os.environ.get("CROSS_BORDER_DUB_PARALLEL") or "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if disable:
+        meta = step_separate(meta)
+        if meta.get("status") == "failed":
+            return meta
+        return step_dub_tts(meta)
+
+    task_id = meta["task_id"]
+    inputs = meta.get("inputs") or {}
+    artifacts = meta.setdefault("artifacts", {})
+    video_path = inputs.get("video_path") or ""
+    if not video_path or not os.path.isfile(video_path):
+        return _set_failed(meta, "video missing before separate", step="separate")
+
+    target_srt = artifacts.get("target_srt") or artifact_path(task_id, "target.srt")
+    if not os.path.isfile(target_srt) or os.path.getsize(target_srt) < 5:
+        return _set_failed(meta, "target.srt missing/empty before dub_tts", step="dub_tts")
+
+    # 状态：先标 separate_running，完成一半后切 dub_tts_running（UI 可见）
+    meta = transition(meta, "separate_running")
+    append_log(meta, "parallel separate + dub_tts start (long-video speed path)")
+    save_meta(meta)
+
+    audio_dir = artifact_path(task_id, "audio")
+    backend = str(inputs.get("separate_backend") or "auto")
+    duck_gain = float(inputs.get("duck_gain") if inputs.get("duck_gain") is not None else 0.18)
+
+    srt_text = read_text_artifact(target_srt)
+    work_dir = artifact_path(task_id, "dub")
+    total_dur = 0.0
+    if video_path and os.path.isfile(video_path):
+        total_dur = mix_mod.probe_duration_seconds(video_path)
+
+    lang = normalize_lang(meta.get("target_lang") or inputs.get("target_lang") or "en")
+    gender = str(inputs.get("voice_gender") or "female")
+    raw_voice = (inputs.get("voice_name") or "").strip()
+    voice_name, voice_corrected = resolve_voice_for_lang(
+        lang, raw_voice, gender=gender, force_match=True
+    )
+    voice_rate = float(inputs.get("voice_rate") or 1.0)
+    voice_pitch = float(inputs.get("voice_pitch") or 1.0)
+    tts_engine = (inputs.get("tts_engine") or "edge_tts").strip() or "edge_tts"
+    workers = synth_mod._tts_worker_count(tts_engine)
+    append_log(
+        meta,
+        f"dub_tts (parallel) lang={lang} voice={voice_name} engine={tts_engine} workers={workers}",
+    )
+    save_meta(meta)
+
+    sep_err: Optional[BaseException] = None
+    tts_err: Optional[BaseException] = None
+    sep_result: Optional[Dict[str, Any]] = None
+    tts_result: Optional[Dict[str, Any]] = None
+
+    def _do_separate() -> Dict[str, Any]:
+        return separate_mod.separate_audio(
+            video_path,
+            audio_dir,
+            backend=backend,
+            duck_gain=duck_gain,
+            reuse_existing=True,
+        )
+
+    def _do_tts() -> Dict[str, Any]:
+        return synth_mod.synthesize_from_srt(
+            srt_text,
+            work_dir,
+            target_lang=lang,
+            voice_name=voice_name,
+            voice_rate=voice_rate,
+            voice_pitch=voice_pitch,
+            tts_engine=tts_engine,
+            total_duration=total_dur,
+            voice_gender=gender,
+            force_voice_lang_match=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_sep = pool.submit(_do_separate)
+        fut_tts = pool.submit(_do_tts)
+        for fut in as_completed({fut_sep: "sep", fut_tts: "tts"}):
+            name = "sep" if fut is fut_sep else "tts"
+            try:
+                val = fut.result()
+            except BaseException as exc:
+                if name == "sep":
+                    sep_err = exc
+                else:
+                    tts_err = exc
+                continue
+            if name == "sep":
+                sep_result = val
+                # 分离先完成时更新状态，方便 UI
+                try:
+                    m = load_meta(task_id)
+                    if m.get("status") == "separate_running":
+                        m = _apply_separate_result(m, val, backend_fallback=backend)
+                        m = transition(m, "separate_done")
+                        m = transition(m, "dub_tts_running")
+                        append_log(m, "separate finished first; waiting dub_tts")
+                        save_meta(m)
+                except Exception as exc:
+                    logger.debug(f"parallel status update after separate: {exc}")
+            else:
+                tts_result = val
+                try:
+                    m = load_meta(task_id)
+                    # TTS 先完成时只写 artifact，状态仍等 separate
+                    m = _apply_dub_tts_result(
+                        m,
+                        val,
+                        raw_voice=raw_voice,
+                        voice_corrected=voice_corrected,
+                        lang=lang,
+                    )
+                    append_log(m, "dub_tts finished; waiting separate" if sep_result is None else "dub_tts finished")
+                    save_meta(m)
+                except Exception as exc:
+                    logger.debug(f"parallel status update after tts: {exc}")
+
+    # 重新加载，合并最终状态
+    meta = load_meta(task_id)
+    if sep_err is not None:
+        logger.exception("parallel separate failed")
+        return _set_failed(meta, f"separate failed: {sep_err}", step="separate")
+    if tts_err is not None:
+        logger.exception("parallel dub_tts failed")
+        return _set_failed(meta, f"dub_tts failed: {tts_err}", step="dub_tts")
+    if not sep_result or not tts_result:
+        return _set_failed(meta, "parallel separate/dub_tts returned empty", step="separate")
+
+    # 确保 artifacts 完整（若状态线程写失败）
+    meta = _apply_separate_result(meta, sep_result, backend_fallback=backend)
+    meta = _apply_dub_tts_result(
+        meta,
+        tts_result,
+        raw_voice=raw_voice,
+        voice_corrected=voice_corrected,
+        lang=lang,
+    )
+    # 规范状态到 dub_tts_done（mix 入口）
+    st = meta.get("status")
+    try:
+        if st == "separate_running":
+            meta = transition(meta, "separate_done")
+            meta = transition(meta, "dub_tts_running")
+            meta = transition(meta, "dub_tts_done")
+        elif st == "separate_done":
+            meta = transition(meta, "dub_tts_running")
+            meta = transition(meta, "dub_tts_done")
+        elif st == "dub_tts_running":
+            meta = transition(meta, "dub_tts_done")
+        elif st != "dub_tts_done":
+            meta["status"] = "dub_tts_done"
+            meta["step"] = "dub_tts"
+            meta["error"] = None
+            meta["progress"] = max(int(meta.get("progress") or 0), 72)
+            save_meta(meta)
+    except Exception as exc:
+        logger.warning(f"parallel status normalize failed ({st}): {exc}; force dub_tts_done")
+        meta["status"] = "dub_tts_done"
+        meta["step"] = "dub_tts"
+        meta["error"] = None
+        save_meta(meta)
+    append_log(meta, "parallel separate + dub_tts done")
+    save_meta(meta)
+    return meta
 
 
 def step_mix(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -1478,12 +1710,51 @@ def run_from(meta: Dict[str, Any], start_step: str = "asr", stop_after: Optional
             meta["error"] = None
             save_meta(meta)
 
+    # 配音长片：separate 与 dub_tts 并行（wall-clock ≈ max(两者)）
+    parallel_dub = (
+        mode == "dubbing"
+        and (os.environ.get("CROSS_BORDER_DUB_PARALLEL") or "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
     started = False
+    skip_next_dub_tts = False
     for step in steps:
         if not started:
             if step != start_step:
                 continue
             started = True
+        if skip_next_dub_tts and step == "dub_tts":
+            skip_next_dub_tts = False
+            if stop_after and step == stop_after:
+                return meta
+            continue
+        # 从 separate 起步且允许并行 → 一次跑完 separate+dub_tts
+        if parallel_dub and step == "separate" and "dub_tts" in steps:
+            try:
+                meta = step_separate_and_dub_tts(meta)
+            except Exception as exc:
+                logger.exception("cross_border parallel separate+dub_tts crashed")
+                return _set_failed(
+                    meta,
+                    f"separate/dub_tts crashed: {exc}\n{traceback.format_exc()[-500:]}",
+                    step="separate",
+                )
+            skip_next_dub_tts = True
+            if meta.get("status") == "failed":
+                err = meta.get("error") or {}
+                if not err.get("step"):
+                    meta["error"] = {
+                        **err,
+                        "step": "separate",
+                        "message": err.get("message") or "failed",
+                    }
+                    meta["step"] = "separate"
+                    save_meta(meta)
+                return meta
+            if stop_after in {"separate", "dub_tts"}:
+                return meta
+            continue
+
         handler = globals().get(f"step_{step}") or STEP_HANDLERS.get(step)
         if handler is None:
             return _set_failed(meta, f"missing handler for step: {step}", step=step)

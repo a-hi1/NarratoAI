@@ -63,6 +63,19 @@ def mix_instrumental_and_voice(
         f"acompressor=threshold=-22dB:ratio=3:attack=5:release=100:makeup=5,"
         f"aformat=sample_rates=44100:channel_layouts=stereo"
     )
+    # loudnorm 双扫描对 17min+ 片很慢；默认用 dynaudnorm 近似响度，可设
+    # CROSS_BORDER_MIX_LOUDNORM=1 强制 classic loudnorm
+    use_loudnorm = (os.environ.get("CROSS_BORDER_MIX_LOUDNORM") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    # dynaudnorm 一次扫描即可，长片明显快；参数偏保守避免泵感
+    loud_tail = (
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
+        if use_loudnorm
+        else "dynaudnorm=f=150:g=15:p=0.9:m=10:r=0.5"
+    )
     if sidechain_duck:
         # 关键：asplit 把人声拆成 sidechain 探测轨 + 最终叠入轨，避免 [vc] 双消费
         thr = max(0.001, min(0.5, float(duck_threshold)))
@@ -73,14 +86,14 @@ def mix_instrumental_and_voice(
             f"[bg0][vcsc]sidechaincompress=threshold={thr}:ratio={ratio}:"
             f"attack=12:release=220:makeup=1:mix=1[bg];"
             f"[bg][vc]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-            f"loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
+            f"{loud_tail}[aout]"
         )
     else:
         filt = (
             f"[0:a]volume={iv:.3f},aformat=sample_rates=44100:channel_layouts=stereo[bg];"
             f"[1:a]{voice_fx}[vc];"
             f"[bg][vc]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-            f"loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
+            f"{loud_tail}[aout]"
         )
     cmd = [
         _ffmpeg(),

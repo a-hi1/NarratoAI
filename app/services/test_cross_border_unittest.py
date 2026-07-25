@@ -830,19 +830,19 @@ class BurnSubtitleModeTests(unittest.TestCase):
     def test_adaptive_style_portrait(self):
         from app.services.cross_border import burn as burn_mod
 
-        # 竖屏 608x1080：short/38 ≈ 16，夹在 14–26
+        # 竖屏 608x1080：short/46 × cinema0.9 ≈ 12，夹在 12–22
         style = burn_mod.adaptive_style(video_width=608, video_height=1080)
         self.assertTrue(style["is_portrait"])
-        self.assertGreaterEqual(style["subtitle_font_size"], 14)
-        self.assertLessEqual(style["subtitle_font_size"], 22)
-        self.assertAlmostEqual(style["subtitle_font_size"], 16, delta=3)
+        self.assertGreaterEqual(style["subtitle_font_size"], 12)
+        self.assertLessEqual(style["subtitle_font_size"], 18)
+        self.assertAlmostEqual(style["subtitle_font_size"], 12, delta=3)
 
-        # 横屏 1920x1080：h/48 ≈ 22.5，电影小字贴底
+        # 横屏 1920x1080：h/56 × cinema0.9 ≈ 17，电影更小贴底
         land = burn_mod.adaptive_style(video_width=1920, video_height=1080)
         self.assertFalse(land["is_portrait"])
-        self.assertGreaterEqual(land["subtitle_font_size"], 18)
-        self.assertLessEqual(land["subtitle_font_size"], 26)
-        self.assertAlmostEqual(land["subtitle_font_size"], 22, delta=3)
+        self.assertGreaterEqual(land["subtitle_font_size"], 14)
+        self.assertLessEqual(land["subtitle_font_size"], 22)
+        self.assertAlmostEqual(land["subtitle_font_size"], 17, delta=3)
 
         style_bi = burn_mod.adaptive_style(
             video_width=608, video_height=1080, bilingual=True
@@ -853,10 +853,10 @@ class BurnSubtitleModeTests(unittest.TestCase):
 
         # 默认 cinema；贴底 margin 小、左右有气口
         self.assertEqual(land["style_key"], "cinema")
-        self.assertGreaterEqual(land["margin_v"], 10)
-        self.assertLessEqual(land["margin_v"], 40)
-        self.assertGreaterEqual(land["margin_lr"], 24)
-        self.assertLessEqual(land["stroke_width"], 1.2)
+        self.assertGreaterEqual(land["margin_v"], 8)
+        self.assertLessEqual(land["margin_v"], 36)
+        self.assertGreaterEqual(land["margin_lr"], 28)
+        self.assertLessEqual(land["stroke_width"], 1.0)
 
         opts = burn_mod.resolve_burn_options(
             {
@@ -869,7 +869,7 @@ class BurnSubtitleModeTests(unittest.TestCase):
         )
         self.assertIn("subtitle_font_size", opts)
         self.assertGreater(opts["subtitle_font_size"], 0)
-        self.assertLessEqual(opts["subtitle_font_size"], 26)
+        self.assertLessEqual(opts["subtitle_font_size"], 22)
         self.assertEqual(opts["subtitle_position"], "bottom")
         self.assertIn("ass_margin_v", opts)
         self.assertGreater(opts["ass_margin_v"], 0)
@@ -880,7 +880,7 @@ class BurnSubtitleModeTests(unittest.TestCase):
             video_path="",
         )
         self.assertNotEqual(opts_legacy["subtitle_font_size"], 48)
-        self.assertLessEqual(opts_legacy["subtitle_font_size"], 32)
+        self.assertLessEqual(opts_legacy["subtitle_font_size"], 28)
 
     def test_mask_bar_options(self):
         from app.services.cross_border import burn as burn_mod
@@ -1277,7 +1277,10 @@ class DubbingModuleTests(unittest.TestCase):
                     m = task_store.transition(m, "burn_done")
                     return task_store.transition(m, "completed")
 
-                with mock.patch.object(
+                # 并行路径会直调 demucs/TTS，单测 mock 逐步 handler 时关闭并行
+                with mock.patch.dict(
+                    os.environ, {"CROSS_BORDER_DUB_PARALLEL": "0"}, clear=False
+                ), mock.patch.object(
                     cb_pipeline,
                     "step_translate",
                     side_effect=lambda m: _fake_translate(m, sample_srt),

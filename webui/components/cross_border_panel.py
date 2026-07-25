@@ -774,10 +774,10 @@ def _render_create_form(tr):
 
                 st.markdown("##### 分离与混音")
                 sep_labels = {
-                    "auto": "自动（优先 demucs 真分离）",
-                    "demucs": "强制 demucs 真分离",
-                    "center_cancel": "立体声中置削弱（近似）",
-                    "duck": "压低原声（保底）",
+                    "auto": "自动（优先 demucs 真分离，CPU 长片较慢）",
+                    "demucs": "强制 demucs 真分离（CPU 长片可能 30–90 分钟）",
+                    "center_cancel": "立体声中置削弱（近似·快）",
+                    "duck": "压低原声（保底·最快）",
                 }
                 separate_backend = st.selectbox(
                     "人声分离方式",
@@ -785,6 +785,11 @@ def _render_create_form(tr):
                     format_func=lambda k: sep_labels[k],
                     index=0 if demucs_ok else 0,
                     key="cb_separate_backend",
+                    help=(
+                        "长视频（>10 分钟）若要快：选「中置削弱」或「压低原声」。"
+                        " demucs 真分离质量最好，但 CPU 无 GPU 时 17 分钟片可能要半小时以上。"
+                        " 人声分离与配音 TTS 已默认并行。"
+                    ),
                 )
                 c_d1, c_d2 = st.columns(2)
                 with c_d1:
@@ -829,8 +834,8 @@ def _render_create_form(tr):
                     help="关闭则只导出配音视频（无硬字幕）。",
                 )
                 st.caption(
-                    "链路：识别 → 翻译 → 人声分离 → 目标语 TTS → 伴奏混音 → 烧字幕。"
-                    " 背景音与配音并存；音色须对应目标语。"
+                    "链路：识别 → 翻译 →（人声分离 ∥ 目标语 TTS 并行）→ 伴奏混音 → 烧字幕。"
+                    " 长片瓶颈多半在 demucs；要快请改「中置削弱/压低原声」。音色须对应目标语。"
                 )
 
             bilingual = st.checkbox(
@@ -881,10 +886,10 @@ def _render_create_form(tr):
             )
             if size_key == "manual":
                 subtitle_font_size = st.slider(
-                    "字号数值（电影字幕 1080p 约 20–24）",
-                    min_value=14,
+                    "字号数值（电影字幕 1080p 约 16–18）",
+                    min_value=12,
                     max_value=48,
-                    value=22,
+                    value=17,
                     step=1,
                     key="cb_font_size",
                 )
@@ -944,8 +949,8 @@ def _render_create_form(tr):
                 )
 
             st.caption(
-                "默认电影字幕：更小字、贴底、细描边，不挡画面。"
-                "1080p 横屏约 22px，竖屏约 16px。成片后仍可在详情页改样式重烧。"
+                "默认电影字幕：更小字、贴底、细描边，方便看画面。"
+                "1080p 横屏约 17px，竖屏约 12px。成片后仍可在详情页改样式重烧。"
             )
 
         with st.expander("术语表与识别（一般不用改）", expanded=False):
