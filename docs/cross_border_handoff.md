@@ -178,6 +178,7 @@ app/services/test_cross_border_unittest.py  # 单测（mock LLM/ASR/burn/url 下
 - 默认预设 `cinema`；另有 `clean` / `netflix` / `soft` / `boxed` / `yellow`
 - 位置：`bottom` / `bottom_high` / `center` / `top`
 - 字号档：`auto` / `small` / `medium` / `large` / 手动
+- **原片硬字幕遮罩条（手动）**：`subtitle_mask_enabled` + `side`(bottom/top) + `height%` + `color`(black/translucent) + `subtitle_on_mask`；burn 时 ffmpeg `drawbox` 盖住原字幕区再烧译文（不识别、不擦除）
 - UI：新建默认电影字幕；详情「改样式后重烧」只重 burn
 - 默认编码器 `libx264`
 

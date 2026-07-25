@@ -16,9 +16,11 @@ from app.models.schema import VideoClipParams, VideoAspect
 
 
 # 初始化配置 - 必须是第一个 Streamlit 命令（中文优先工具）
+_FAVICON = os.path.join(os.path.dirname(__file__), "resource", "public", "favicon.png")
+_PAGE_ICON = _FAVICON if os.path.isfile(_FAVICON) else "📽️"
 st.set_page_config(
     page_title="NarratoAI 影视解说工坊",
-    page_icon="📽️",
+    page_icon=_PAGE_ICON,
     layout="wide",
     initial_sidebar_state="auto",
     menu_items={
@@ -31,6 +33,14 @@ st.set_page_config(
         ),
     },
 )
+
+# 侧栏品牌 logo（Streamlit 原生 st.logo；缺文件时静默跳过）
+_LOGO = os.path.join(os.path.dirname(__file__), "resource", "public", "logo.png")
+if os.path.isfile(_LOGO):
+    try:
+        st.logo(_LOGO, size="large")
+    except Exception:
+        pass
 
 # 整站设计系统：扁平浅色、专业工具风（见 webui/styles.py + .streamlit/config.toml）
 ui_styles.inject_global_css()

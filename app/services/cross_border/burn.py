@@ -101,10 +101,162 @@ POSITION_PRESETS: Dict[str, Dict[str, Any]] = {
     "top": {"align": 8, "margin_v_ratio": 0.035, "y_percent": None},
 }
 
+# 原片硬字幕遮罩条：手动勾选，不依赖识别
+MASK_SIDE_PRESETS: Dict[str, str] = {
+    "bottom": "底部遮罩条",
+    "top": "顶部遮罩条",
+}
+MASK_COLOR_PRESETS: Dict[str, str] = {
+    "black": "纯黑",
+    "translucent": "半透明黑",
+}
+# 高度占画面高 %；默认盖住常见底部硬字幕
+DEFAULT_MASK_HEIGHT_PERCENT = 14.0
+MASK_HEIGHT_MIN = 6.0
+MASK_HEIGHT_MAX = 28.0
+
 
 def style_choices_for_ui() -> List[Tuple[str, str]]:
     """[(key, label), ...]"""
     return [(k, v["label"]) for k, v in STYLE_PRESETS.items()]
+
+
+def mask_side_choices_for_ui() -> List[Tuple[str, str]]:
+    return list(MASK_SIDE_PRESETS.items())
+
+
+def mask_color_choices_for_ui() -> List[Tuple[str, str]]:
+    return list(MASK_COLOR_PRESETS.items())
+
+
+def _clamp_mask_height(value: Any) -> float:
+    try:
+        h = float(value)
+    except (TypeError, ValueError):
+        h = DEFAULT_MASK_HEIGHT_PERCENT
+    return max(MASK_HEIGHT_MIN, min(MASK_HEIGHT_MAX, h))
+
+
+def build_mask_region_options(
+    *,
+    side: str = "bottom",
+    height_percent: float = DEFAULT_MASK_HEIGHT_PERCENT,
+    color: str = "black",
+) -> Dict[str, Any]:
+    """
+    把跨境简化 UI 映射成 generate_video 的 subtitle_mask_* 区域参数。
+
+    - side: bottom|top
+    - height_percent: 遮罩条高度占画面高
+    - color: black|translucent → solid 条的不透明度
+    """
+    side = (side or "bottom").strip().lower()
+    if side not in MASK_SIDE_PRESETS:
+        side = "bottom"
+    color = (color or "black").strip().lower()
+    if color not in MASK_COLOR_PRESETS:
+        color = "black"
+    height = _clamp_mask_height(height_percent)
+    # 全宽条，略留左右气口避免裁切感
+    x_percent = 0.0
+    width_percent = 100.0
+    y_percent = max(0.0, 100.0 - height) if side == "bottom" else 0.0
+    opacity = 100 if color == "black" else 72
+    # solid 条不需要高斯模糊；blur_radius=0 走 drawbox 纯色路径
+    common = {
+        "x_percent": x_percent,
+        "y_percent": y_percent,
+        "width_percent": width_percent,
+        "height_percent": height,
+        "blur_radius": 0,
+        "opacity_percent": opacity,
+    }
+    out: Dict[str, Any] = {
+        "subtitle_mask_enabled": True,
+        "subtitle_mask_mode": "solid",
+        "subtitle_mask_side": side,
+        "subtitle_mask_color": color,
+        "subtitle_mask_height_percent": height,
+    }
+    for orientation in ("landscape", "portrait"):
+        for field, val in common.items():
+            out[f"subtitle_mask_{orientation}_{field}"] = val
+    return out
+
+
+def apply_mask_to_burn_options(
+    opts: Dict[str, Any],
+    inputs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    根据 inputs 中的遮罩开关，写入 merge_materials 可用的 mask 字段，
+    并在「字幕叠在遮罩上」时微调位置/边距。
+    """
+    enabled = bool(inputs.get("subtitle_mask_enabled"))
+    if not enabled:
+        opts["subtitle_mask_enabled"] = False
+        opts["subtitle_mask_mode"] = "off"
+        return opts
+
+    side = str(inputs.get("subtitle_mask_side") or "bottom").strip().lower()
+    if side not in MASK_SIDE_PRESETS:
+        side = "bottom"
+    color = str(inputs.get("subtitle_mask_color") or "black").strip().lower()
+    if color not in MASK_COLOR_PRESETS:
+        color = "black"
+    height = _clamp_mask_height(
+        inputs.get("subtitle_mask_height_percent") or DEFAULT_MASK_HEIGHT_PERCENT
+    )
+    on_mask = inputs.get("subtitle_on_mask")
+    if on_mask is None:
+        on_mask = True
+    on_mask = bool(on_mask)
+
+    region = build_mask_region_options(
+        side=side, height_percent=height, color=color
+    )
+    opts.update(region)
+    opts["subtitle_on_mask"] = on_mask
+
+    h = int((opts.get("_adaptive") or {}).get("video_height") or 0) or int(
+        opts.get("video_height") or 0
+    )
+    if h <= 0:
+        h = 1080
+    mask_px = max(20, int(round(h * height / 100.0)))
+
+    # 字幕叠在遮罩条上：把文字锚到条内中下部/中上部
+    # 不叠：把文字挪到遮罩外侧，避免写在条上又被盖住观感
+    if on_mask:
+        if side == "bottom":
+            opts["subtitle_position"] = "bottom"
+            opts["ass_alignment"] = 2
+            # 条高一半左右，字落在条中央偏下
+            opts["ass_margin_v"] = max(12, int(round(mask_px * 0.32)))
+            opts["custom_position"] = 100.0 - (opts["ass_margin_v"] / h * 100.0)
+        else:
+            opts["subtitle_position"] = "top"
+            opts["ass_alignment"] = 8
+            opts["ass_margin_v"] = max(12, int(round(mask_px * 0.28)))
+            opts["custom_position"] = opts["ass_margin_v"] / h * 100.0
+    else:
+        if side == "bottom":
+            # 抬高到遮罩上方
+            opts["subtitle_position"] = "bottom"
+            opts["ass_alignment"] = 2
+            opts["ass_margin_v"] = max(
+                int(opts.get("ass_margin_v") or 20),
+                mask_px + max(10, int(round(h * 0.012))),
+            )
+            opts["custom_position"] = 100.0 - (opts["ass_margin_v"] / h * 100.0)
+        else:
+            opts["subtitle_position"] = "bottom"
+            opts["ass_alignment"] = 2
+            # 顶遮罩时默认仍贴底写译文
+            opts["ass_margin_v"] = max(int(opts.get("ass_margin_v") or 16), int(round(h * 0.024)))
+            opts["custom_position"] = 100.0 - (opts["ass_margin_v"] / h * 100.0)
+
+    return opts
 
 
 def _parse_srt_blocks(text: str) -> List[Tuple[str, str, str]]:
@@ -388,13 +540,13 @@ def resolve_burn_options(
     except (TypeError, ValueError):
         stroke_width = float(style["stroke_width"])
 
-    return {
+    opts: Dict[str, Any] = {
         "keep_original_audio": True,
         "original_audio_volume": 1.0,
         "voice_volume": 0.0,
         "bgm_volume": 0.0,
         "subtitle_enabled": True,
-        "subtitle_mask_enabled": bool(inputs.get("subtitle_mask_enabled", False)),
+        "subtitle_mask_enabled": False,
         "subtitle_font": font,
         "subtitle_font_size": int(style["subtitle_font_size"]),
         "subtitle_color": color,
@@ -429,6 +581,15 @@ def resolve_burn_options(
             "bilingual": bilingual,
         },
     }
+    # 原片硬字幕遮罩条（手动，可选）
+    opts = apply_mask_to_burn_options(opts, inputs)
+    ad = opts.setdefault("_adaptive", {})
+    ad["mask_enabled"] = bool(opts.get("subtitle_mask_enabled"))
+    ad["mask_side"] = opts.get("subtitle_mask_side") or ""
+    ad["mask_color"] = opts.get("subtitle_mask_color") or ""
+    ad["mask_height_percent"] = opts.get("subtitle_mask_height_percent")
+    ad["subtitle_on_mask"] = bool(opts.get("subtitle_on_mask", True))
+    return opts
 
 
 def burn_subtitles_to_video(
@@ -458,7 +619,11 @@ def burn_subtitles_to_video(
         "burn style: "
         f"font={opts.get('subtitle_font')} size={opts.get('subtitle_font_size')} "
         f"stroke={opts.get('stroke_width')} pos={opts.get('subtitle_position')} "
-        f"margin_v={opts.get('ass_margin_v')} adaptive={opts.get('_adaptive')}"
+        f"margin_v={opts.get('ass_margin_v')} "
+        f"mask={opts.get('subtitle_mask_enabled')} "
+        f"mask_side={opts.get('subtitle_mask_side')} "
+        f"mask_h={opts.get('subtitle_mask_height_percent')} "
+        f"adaptive={opts.get('_adaptive')}"
     )
 
     from app.services.generate_video import merge_materials

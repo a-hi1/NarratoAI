@@ -858,6 +858,90 @@ class BurnSubtitleModeTests(unittest.TestCase):
         self.assertNotEqual(opts_legacy["subtitle_font_size"], 48)
         self.assertLessEqual(opts_legacy["subtitle_font_size"], 32)
 
+    def test_mask_bar_options(self):
+        from app.services.cross_border import burn as burn_mod
+
+        region = burn_mod.build_mask_region_options(
+            side="bottom", height_percent=16, color="black"
+        )
+        self.assertTrue(region["subtitle_mask_enabled"])
+        self.assertEqual(region["subtitle_mask_mode"], "solid")
+        self.assertEqual(region["subtitle_mask_side"], "bottom")
+        self.assertEqual(region["subtitle_mask_landscape_height_percent"], 16)
+        self.assertAlmostEqual(region["subtitle_mask_landscape_y_percent"], 84.0)
+        self.assertEqual(region["subtitle_mask_landscape_blur_radius"], 0)
+        self.assertEqual(region["subtitle_mask_landscape_opacity_percent"], 100)
+
+        top = burn_mod.build_mask_region_options(
+            side="top", height_percent=12, color="translucent"
+        )
+        self.assertEqual(top["subtitle_mask_side"], "top")
+        self.assertEqual(top["subtitle_mask_landscape_y_percent"], 0.0)
+        self.assertEqual(top["subtitle_mask_landscape_height_percent"], 12)
+        self.assertEqual(top["subtitle_mask_landscape_opacity_percent"], 72)
+
+        # 关闭遮罩
+        opts_off = burn_mod.resolve_burn_options(
+            {"subtitle_mask_enabled": False, "subtitle_style": "cinema"},
+            video_path="",
+        )
+        self.assertFalse(opts_off["subtitle_mask_enabled"])
+
+        # 底部遮罩 + 字幕叠在条上 → 贴底 margin 落在条内
+        opts_on = burn_mod.resolve_burn_options(
+            {
+                "subtitle_mask_enabled": True,
+                "subtitle_mask_side": "bottom",
+                "subtitle_mask_color": "black",
+                "subtitle_mask_height_percent": 14,
+                "subtitle_on_mask": True,
+                "subtitle_position_key": "bottom",
+            },
+            video_path="",
+        )
+        self.assertTrue(opts_on["subtitle_mask_enabled"])
+        self.assertEqual(opts_on["subtitle_mask_mode"], "solid")
+        self.assertEqual(opts_on["subtitle_mask_side"], "bottom")
+        self.assertTrue(opts_on.get("subtitle_on_mask"))
+        self.assertEqual(opts_on["subtitle_position"], "bottom")
+        self.assertGreater(opts_on["ass_margin_v"], 0)
+        self.assertEqual(opts_on["subtitle_mask_landscape_height_percent"], 14.0)
+
+        # 不叠在条上：margin 应抬高到遮罩外
+        opts_off_text = burn_mod.resolve_burn_options(
+            {
+                "subtitle_mask_enabled": True,
+                "subtitle_mask_side": "bottom",
+                "subtitle_mask_height_percent": 14,
+                "subtitle_on_mask": False,
+            },
+            video_path="",
+        )
+        self.assertGreater(
+            opts_off_text["ass_margin_v"], opts_on["ass_margin_v"]
+        )
+
+        # 顶部遮罩 + 叠在条上
+        opts_top = burn_mod.resolve_burn_options(
+            {
+                "subtitle_mask_enabled": True,
+                "subtitle_mask_side": "top",
+                "subtitle_mask_height_percent": 12,
+                "subtitle_on_mask": True,
+            },
+            video_path="",
+        )
+        self.assertEqual(opts_top["subtitle_position"], "top")
+        self.assertEqual(opts_top["ass_alignment"], 8)
+
+        # 高度夹紧
+        self.assertEqual(
+            burn_mod._clamp_mask_height(3), burn_mod.MASK_HEIGHT_MIN
+        )
+        self.assertEqual(
+            burn_mod._clamp_mask_height(99), burn_mod.MASK_HEIGHT_MAX
+        )
+
     def test_subtitle_mode_pipeline_to_burn(self):
         from app.services.cross_border import pipeline as cb_pipeline
 

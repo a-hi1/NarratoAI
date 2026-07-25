@@ -225,6 +225,11 @@ def create_task(
     subtitle_size_preset: str = "auto",
     subtitle_position_key: str = "bottom",
     subtitle_font_size_user_set: bool = False,
+    subtitle_mask_enabled: bool = False,
+    subtitle_mask_side: str = "bottom",
+    subtitle_mask_color: str = "black",
+    subtitle_mask_height_percent: float = 14.0,
+    subtitle_on_mask: bool = True,
 ) -> Dict[str, Any]:
     direction = (direction or "inbound").lower()
     if direction not in {"inbound", "outbound"}:
@@ -318,6 +323,14 @@ def create_task(
             "subtitle_size_preset": (subtitle_size_preset or "auto").strip().lower()
             or "auto",
             "subtitle_color": (subtitle_color or "#FFFFFF").strip() or "#FFFFFF",
+            # 原片硬字幕遮罩条（手动，默认关）
+            "subtitle_mask_enabled": bool(subtitle_mask_enabled),
+            "subtitle_mask_side": (subtitle_mask_side or "bottom").strip().lower()
+            or "bottom",
+            "subtitle_mask_color": (subtitle_mask_color or "black").strip().lower()
+            or "black",
+            "subtitle_mask_height_percent": float(subtitle_mask_height_percent or 14.0),
+            "subtitle_on_mask": bool(subtitle_on_mask),
         },
         "artifacts": {
             "source_srt": "",

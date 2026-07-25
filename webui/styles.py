@@ -121,6 +121,15 @@ html, body, [class*="css"] {{
   letter-spacing: -0.02em;
   background: linear-gradient(135deg, var(--na-primary) 0%, #4F46E5 100%);
 }}
+.narrato-hero-logo {{
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  flex: 0 0 auto;
+  display: block;
+  object-fit: contain;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}}
 .narrato-hero-title {{
   font-size: 1.35rem;
   font-weight: 750;
@@ -505,6 +514,27 @@ def inject_global_css() -> None:
     st.markdown(APP_CSS, unsafe_allow_html=True)
 
 
+def _resolve_logo_data_uri() -> str:
+    """把 resource/public/logo.png 编成 data URI，避免 Streamlit 静态路径问题。"""
+    try:
+        import base64
+        import os
+
+        candidates = [
+            os.path.join(os.path.dirname(__file__), "..", "resource", "public", "logo.png"),
+            os.path.join(os.getcwd(), "resource", "public", "logo.png"),
+        ]
+        for path in candidates:
+            path = os.path.abspath(path)
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+    except Exception:
+        pass
+    return ""
+
+
 def hero_html(
     *,
     title: str,
@@ -520,10 +550,18 @@ def hero_html(
     )
     if version:
         chip_html += f'<span class="narrato-chip">v{escape(str(version))}</span>'
+    logo_uri = _resolve_logo_data_uri()
+    if logo_uri:
+        mark_html = (
+            f'<img class="narrato-hero-logo" src="{logo_uri}" '
+            f'alt="NarratoAI" width="42" height="42"/>'
+        )
+    else:
+        mark_html = '<div class="narrato-hero-mark">NA</div>'
     return f"""
     <div class="narrato-hero">
       <div class="narrato-hero-brand">
-        <div class="narrato-hero-mark">NA</div>
+        {mark_html}
         <div>
           <div class="narrato-hero-title">{title_html}</div>
           <p class="narrato-hero-sub">{escape(subtitle)}</p>

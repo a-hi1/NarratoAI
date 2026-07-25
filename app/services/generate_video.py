@@ -1261,25 +1261,43 @@ def _build_ffmpeg_merge_command(
 
     if subtitle_enabled and subtitle_mask_enabled:
         region = _resolve_subtitle_mask_region(video_width, video_height, options)
-        mask_path = _create_subtitle_mask_alpha_file(region, output_dir)
-        temp_files.append(mask_path)
-        mask_input_index = next_input_index
-        next_input_index += 1
-        input_args.extend(["-loop", "1", "-t", duration_arg, "-i", mask_path])
+        mask_mode = str(options.get("subtitle_mask_mode") or "").strip().lower()
+        # solid/drawbox/bar：纯色或半透明矩形条（跨境遮挡原硬字幕）
+        # 其它/空：沿用主站 Speclip 风格模糊遮罩
+        use_solid = mask_mode in {"solid", "drawbox", "bar"}
+
         logger.info(
             "ffmpeg 字幕遮罩已启用: "
+            f"mode={'solid' if use_solid else 'blur'} "
             f"{region['orientation']} x={region['x']} y={region['y']} "
-            f"w={region['width']} h={region['height']} blur={region['blur_radius']}"
+            f"w={region['width']} h={region['height']} blur={region['blur_radius']} "
+            f"opacity={region['opacity']}"
         )
-        video_filters.extend(
-            _build_mask_filter(
-                input_label=current_video_label,
-                mask_input_index=mask_input_index,
-                region=region,
-                output_label="[v_masked]",
+        if use_solid:
+            alpha = max(0.0, min(1.0, float(region.get("opacity") or 1.0)))
+            color = f"black@{alpha:.3f}" if alpha < 0.999 else "black"
+            video_filters.append(
+                f"{current_video_label}drawbox="
+                f"x={region['x']}:y={region['y']}:"
+                f"w={region['width']}:h={region['height']}:"
+                f"color={color}:t=fill[v_masked]"
             )
-        )
-        current_video_label = "[v_masked]"
+            current_video_label = "[v_masked]"
+        else:
+            mask_path = _create_subtitle_mask_alpha_file(region, output_dir)
+            temp_files.append(mask_path)
+            mask_input_index = next_input_index
+            next_input_index += 1
+            input_args.extend(["-loop", "1", "-t", duration_arg, "-i", mask_path])
+            video_filters.extend(
+                _build_mask_filter(
+                    input_label=current_video_label,
+                    mask_input_index=mask_input_index,
+                    region=region,
+                    output_label="[v_masked]",
+                )
+            )
+            current_video_label = "[v_masked]"
 
     if valid_subtitle:
         font_path = _resolve_font_path(subtitle_font)

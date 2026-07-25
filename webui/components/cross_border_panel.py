@@ -284,6 +284,24 @@ def _render_create_form(tr):
     )
     direction = "inbound" if direction_label.startswith("引入") else "outbound"
 
+    # Streamlit 带 key 的输入框会锁定 session_state；切换方向时必须同步语对/默认音色等
+    if st.session_state.get("cb_direction_synced") != direction:
+        if direction == "inbound":
+            st.session_state["cb_source_lang"] = "en"
+            st.session_state["cb_target_lang"] = "zh"
+            st.session_state["cb_voice_name"] = "zh-CN-XiaoyiNeural"
+            st.session_state["cb_platform"] = "douyin"
+            st.session_state["cb_word_count"] = 320
+            st.session_state["cb_ost_ratio"] = 30
+        else:
+            st.session_state["cb_source_lang"] = "zh"
+            st.session_state["cb_target_lang"] = "en"
+            st.session_state["cb_voice_name"] = "en-US-JennyNeural"
+            st.session_state["cb_platform"] = "tiktok"
+            st.session_state["cb_word_count"] = 150
+            st.session_state["cb_ost_ratio"] = 20
+        st.session_state["cb_direction_synced"] = direction
+
     st.markdown("**③ 准备素材**")
     source_mode = st.radio(
         "素材来源",
@@ -365,6 +383,11 @@ def _render_create_form(tr):
     subtitle_size_preset = "auto"
     subtitle_position_key = "bottom"
     subtitle_font_size_user_set = False
+    subtitle_mask_enabled = False
+    subtitle_mask_side = "bottom"
+    subtitle_mask_color = "black"
+    subtitle_mask_height_percent = 14.0
+    subtitle_on_mask = True
     asr_backend = "auto"
     if mode == "subtitle":
         from app.services.cross_border import burn as burn_mod
@@ -434,6 +457,52 @@ def _render_create_form(tr):
                 subtitle_size_preset = size_key if size_key != "medium" else "auto"
                 if size_key == "medium":
                     subtitle_size_preset = "medium"
+
+            st.markdown("##### 原片硬字幕遮罩（可选）")
+            subtitle_mask_enabled = st.checkbox(
+                "用遮罩条盖住原片硬字幕，再烧译文",
+                value=False,
+                key="cb_mask_enabled",
+                help="原片底部/顶部已烧死字幕时勾选。不会擦除画面，只是盖住再叠新字幕。",
+            )
+            if subtitle_mask_enabled:
+                m1, m2 = st.columns(2)
+                with m1:
+                    side_labels = dict(burn_mod.mask_side_choices_for_ui())
+                    subtitle_mask_side = st.selectbox(
+                        "遮罩位置",
+                        options=list(side_labels.keys()),
+                        format_func=lambda k: side_labels[k],
+                        index=0,
+                        key="cb_mask_side",
+                    )
+                with m2:
+                    color_labels = dict(burn_mod.mask_color_choices_for_ui())
+                    subtitle_mask_color = st.selectbox(
+                        "遮罩颜色",
+                        options=list(color_labels.keys()),
+                        format_func=lambda k: color_labels[k],
+                        index=0,
+                        key="cb_mask_color",
+                    )
+                subtitle_mask_height_percent = st.slider(
+                    "遮罩高度（占画面高 %）",
+                    min_value=int(burn_mod.MASK_HEIGHT_MIN),
+                    max_value=int(burn_mod.MASK_HEIGHT_MAX),
+                    value=int(burn_mod.DEFAULT_MASK_HEIGHT_PERCENT),
+                    step=1,
+                    key="cb_mask_height",
+                )
+                subtitle_on_mask = st.checkbox(
+                    "新字幕叠在遮罩条上",
+                    value=True,
+                    key="cb_on_mask",
+                    help="开启：译文写在遮罩条内。关闭：译文挪到遮罩外侧。",
+                )
+                st.caption(
+                    "建议：原字幕贴底 → 底部遮罩 + 叠在条上；"
+                    "原字幕偏高且不想挡画面 → 可改「字幕位置」为顶部，或关掉「叠在条上」。"
+                )
 
             st.caption(
                 "默认电影字幕：更小字、贴底、细描边，不挡画面。"
@@ -524,11 +593,12 @@ def _render_create_form(tr):
                 key="cb_duration_mode",
             )
         with col2:
+            if "cb_ost_ratio" not in st.session_state:
+                st.session_state["cb_ost_ratio"] = 30 if direction == "inbound" else 20
             original_audio_ratio = st.slider(
                 "原片占比目标 %",
                 min_value=0,
                 max_value=90,
-                value=30 if direction == "inbound" else 20,
                 step=5,
                 key="cb_ost_ratio",
             )
@@ -542,11 +612,22 @@ def _render_create_form(tr):
         )
 
     with st.expander("高级", expanded=False):
+        # 语对随方向自动切换（见上方 cb_direction_synced）；此处只读 session / 允许手改
+        expected_pair = "en → zh" if direction == "inbound" else "zh → en"
+        st.caption(
+            f"当前方向：**{_DIRECTION_CN.get(direction, direction)}**，默认语对 **{expected_pair}**。"
+            " 切换「引入/出海」会自动改源/目标语言；仍可在下面手改。"
+        )
         c1, c2 = st.columns(2)
         with c1:
-            source_lang = st.text_input("源语言", value=source_lang, key="cb_source_lang")
+            # 不用 value= 抢 key：由 session_state 驱动，避免方向切换后仍显示旧值
+            if "cb_source_lang" not in st.session_state:
+                st.session_state["cb_source_lang"] = source_lang
+            source_lang = st.text_input("源语言", key="cb_source_lang")
         with c2:
-            target_lang = st.text_input("目标语言", value=target_lang, key="cb_target_lang")
+            if "cb_target_lang" not in st.session_state:
+                st.session_state["cb_target_lang"] = target_lang
+            target_lang = st.text_input("目标语言", key="cb_target_lang")
         if mode == "narration":
             asr_backend_label = st.selectbox(
                 "ASR 后端",
@@ -582,23 +663,23 @@ def _render_create_form(tr):
                 ],
                 key="cb_content_type",
             )
-            platform = st.text_input("目标平台", value=platform, key="cb_platform")
+            if "cb_platform" not in st.session_state:
+                st.session_state["cb_platform"] = platform
+            platform = st.text_input("目标平台", key="cb_platform")
+            if "cb_word_count" not in st.session_state:
+                st.session_state["cb_word_count"] = int(narration_word_count)
             narration_word_count = st.number_input(
                 "目标文案字数/词数",
                 min_value=50,
                 max_value=5000,
-                value=int(narration_word_count),
                 step=10,
                 key="cb_word_count",
             )
-            default_voice = (
-                "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
-            )
-            voice_name = st.text_input(
-                "TTS 音色",
-                value=default_voice,
-                key="cb_voice_name",
-            )
+            if "cb_voice_name" not in st.session_state:
+                st.session_state["cb_voice_name"] = (
+                    "zh-CN-XiaoyiNeural" if direction == "inbound" else "en-US-JennyNeural"
+                )
+            voice_name = st.text_input("TTS 音色", key="cb_voice_name")
             tts_engine = st.selectbox(
                 "TTS 引擎",
                 options=["", "edge_tts", "azure_speech", "doubaotts", "tencent_tts", "qwen3_tts"],
@@ -657,6 +738,11 @@ def _render_create_form(tr):
             subtitle_size_preset=subtitle_size_preset,
             subtitle_position_key=subtitle_position_key,
             subtitle_font_size_user_set=bool(subtitle_font_size_user_set),
+            subtitle_mask_enabled=bool(subtitle_mask_enabled),
+            subtitle_mask_side=subtitle_mask_side,
+            subtitle_mask_color=subtitle_mask_color,
+            subtitle_mask_height_percent=float(subtitle_mask_height_percent or 14.0),
+            subtitle_on_mask=bool(subtitle_on_mask),
         )
         # 手动字号时关掉自适应
         if subtitle_font_size_user_set and int(subtitle_font_size or 0) > 0:
@@ -1055,6 +1141,54 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
                 key=f"cb_reburn_bilingual_{task_id}",
             )
 
+            st.markdown("##### 原片硬字幕遮罩")
+            reburn_mask = st.checkbox(
+                "启用遮罩条盖住原字幕",
+                value=bool(cur.get("subtitle_mask_enabled")),
+                key=f"cb_reburn_mask_{task_id}",
+            )
+            reburn_mask_side = str(cur.get("subtitle_mask_side") or "bottom")
+            reburn_mask_color = str(cur.get("subtitle_mask_color") or "black")
+            reburn_mask_h = float(cur.get("subtitle_mask_height_percent") or 14.0)
+            reburn_on_mask = bool(cur.get("subtitle_on_mask", True))
+            if reburn_mask:
+                rm1, rm2 = st.columns(2)
+                with rm1:
+                    side_labels = dict(burn_mod.mask_side_choices_for_ui())
+                    if reburn_mask_side not in side_labels:
+                        reburn_mask_side = "bottom"
+                    reburn_mask_side = st.selectbox(
+                        "遮罩位置",
+                        options=list(side_labels.keys()),
+                        format_func=lambda k: side_labels[k],
+                        index=list(side_labels.keys()).index(reburn_mask_side),
+                        key=f"cb_reburn_mask_side_{task_id}",
+                    )
+                with rm2:
+                    color_labels = dict(burn_mod.mask_color_choices_for_ui())
+                    if reburn_mask_color not in color_labels:
+                        reburn_mask_color = "black"
+                    reburn_mask_color = st.selectbox(
+                        "遮罩颜色",
+                        options=list(color_labels.keys()),
+                        format_func=lambda k: color_labels[k],
+                        index=list(color_labels.keys()).index(reburn_mask_color),
+                        key=f"cb_reburn_mask_color_{task_id}",
+                    )
+                reburn_mask_h = st.slider(
+                    "遮罩高度 %",
+                    min_value=int(burn_mod.MASK_HEIGHT_MIN),
+                    max_value=int(burn_mod.MASK_HEIGHT_MAX),
+                    value=int(max(burn_mod.MASK_HEIGHT_MIN, min(burn_mod.MASK_HEIGHT_MAX, reburn_mask_h))),
+                    step=1,
+                    key=f"cb_reburn_mask_h_{task_id}",
+                )
+                reburn_on_mask = st.checkbox(
+                    "新字幕叠在遮罩条上",
+                    value=reburn_on_mask,
+                    key=f"cb_reburn_on_mask_{task_id}",
+                )
+
             # 预览将采用的自适应字号
             try:
                 preview = burn_mod.resolve_burn_options(
@@ -1065,15 +1199,28 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
                         "subtitle_font_size": reburn_manual if reburn_size == "manual" else 0,
                         "subtitle_font_size_user_set": reburn_size == "manual",
                         "bilingual": reburn_bilingual,
+                        "subtitle_mask_enabled": reburn_mask,
+                        "subtitle_mask_side": reburn_mask_side,
+                        "subtitle_mask_color": reburn_mask_color,
+                        "subtitle_mask_height_percent": reburn_mask_h,
+                        "subtitle_on_mask": reburn_on_mask,
                     },
                     video_path=str(cur.get("video_path") or ""),
                 )
                 ad = preview.get("_adaptive") or {}
+                mask_tip = ""
+                if preview.get("subtitle_mask_enabled"):
+                    mask_tip = (
+                        f" · 遮罩 {preview.get('subtitle_mask_side')}/"
+                        f"{preview.get('subtitle_mask_height_percent')}%"
+                        f"/{preview.get('subtitle_mask_color')}"
+                    )
                 st.caption(
                     f"预览：字号 **{preview.get('subtitle_font_size')}** · "
                     f"描边 {preview.get('stroke_width')} · "
                     f"MarginV {preview.get('ass_margin_v')} · "
                     f"分辨率 {ad.get('video_width')}×{ad.get('video_height')}"
+                    f"{mask_tip}"
                 )
             except Exception:
                 pass
@@ -1094,6 +1241,11 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
                 meta["inputs"]["subtitle_position_key"] = reburn_pos
                 meta["inputs"]["subtitle_position"] = reburn_pos
                 meta["inputs"]["bilingual"] = bool(reburn_bilingual)
+                meta["inputs"]["subtitle_mask_enabled"] = bool(reburn_mask)
+                meta["inputs"]["subtitle_mask_side"] = reburn_mask_side
+                meta["inputs"]["subtitle_mask_color"] = reburn_mask_color
+                meta["inputs"]["subtitle_mask_height_percent"] = float(reburn_mask_h)
+                meta["inputs"]["subtitle_on_mask"] = bool(reburn_on_mask)
                 if reburn_size == "manual":
                     meta["inputs"]["subtitle_size_preset"] = "auto"
                     meta["inputs"]["subtitle_font_size"] = int(reburn_manual)
@@ -1106,7 +1258,9 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
                     meta["inputs"]["subtitle_auto_style"] = True
                 task_store.append_log(
                     meta,
-                    f"reburn style={reburn_style} pos={reburn_pos} size={reburn_size} bilingual={reburn_bilingual}",
+                    f"reburn style={reburn_style} pos={reburn_pos} size={reburn_size} "
+                    f"bilingual={reburn_bilingual} mask={reburn_mask} "
+                    f"side={reburn_mask_side} h={reburn_mask_h}",
                 )
                 task_store.save_meta(meta)
                 cb_pipeline.continue_after_translate(task_id)
