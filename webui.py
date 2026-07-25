@@ -22,7 +22,7 @@ st.set_page_config(
     page_title="NarratoAI 影视解说工坊",
     page_icon=_PAGE_ICON,
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="expanded",
     menu_items={
         "Report a bug": "https://github.com/linyqh/NarratoAI/issues",
         "About": (
@@ -34,20 +34,45 @@ st.set_page_config(
     },
 )
 
-# 侧栏品牌 logo（Streamlit 原生 st.logo；缺文件时静默跳过）
-_LOGO = os.path.join(os.path.dirname(__file__), "resource", "public", "logo.png")
-if os.path.isfile(_LOGO):
-    try:
-        st.logo(_LOGO, size="large")
-    except Exception:
-        pass
-
-# 整站设计系统：扁平浅色、专业工具风（见 webui/styles.py + .streamlit/config.toml）
+# 整站设计系统：Studio Premium + App Shell（见 webui/styles.py + .streamlit/config.toml）
 ui_styles.inject_global_css()
+
+# 主导航页：侧栏 IA（大应用结构）
+_NAV_NARRATION = "narration"
+_NAV_CROSS_BORDER = "cross_border"
+_NAV_SETTINGS = "settings"
+_NAV_ITEMS = [
+    {
+        "key": _NAV_NARRATION,
+        "label": "影视解说",
+        "hint": "脚本 → 配音 → 成片",
+        "path": "工作台 / 影视解说",
+        "icon": ":material/movie:",
+    },
+    {
+        "key": _NAV_CROSS_BORDER,
+        "label": "跨境本地化",
+        "hint": "翻译字幕 · 多语配音",
+        "path": "工作台 / 跨境本地化",
+        "icon": ":material/public:",
+    },
+    {
+        "key": _NAV_SETTINGS,
+        "label": "设置",
+        "hint": "模型 · 代理 · 系统",
+        "path": "系统 / 设置",
+        "icon": ":material/settings:",
+    },
+]
+_NAV_BY_KEY = {item["key"]: item for item in _NAV_ITEMS}
 
 
 def init_log():
-    """初始化日志配置"""
+    """初始化日志配置（每个浏览器 session 只装一次，避免切换导航重复挂 handler）。"""
+    if st.session_state.get("_na_log_inited"):
+        return
+    st.session_state["_na_log_inited"] = True
+
     from loguru import logger
     logger.remove()
     _lvl = "INFO"  # 改为 INFO 级别，过滤掉 DEBUG 日志
@@ -140,11 +165,71 @@ def init_global_state():
 
 
 def tr(key):
-    """翻译函数"""
-    i18n_dir = os.path.join(os.path.dirname(__file__), "webui", "i18n")
-    locales = utils.load_locales(i18n_dir)
-    loc = locales.get(st.session_state['ui_language'], {})
+    """翻译函数（locales 缓存到 session，避免每次切换导航重读 JSON）。"""
+    cache_key = "_na_locales_cache"
+    lang = st.session_state.get("ui_language") or "zh"
+    locales = st.session_state.get(cache_key)
+    if not locales or st.session_state.get("_na_locales_lang") != lang:
+        i18n_dir = os.path.join(os.path.dirname(__file__), "webui", "i18n")
+        locales = utils.load_locales(i18n_dir)
+        st.session_state[cache_key] = locales
+        st.session_state["_na_locales_lang"] = lang
+    loc = locales.get(lang, {})
     return loc.get("Translation", {}).get(key, key)
+
+
+def _set_app_nav(nav_key: str) -> None:
+    """侧栏导航 on_click：在 rerun 前写入，避免双次刷新。"""
+    st.session_state["app_nav"] = nav_key
+
+
+def _render_sidebar_shell() -> str:
+    """
+    大应用侧栏：品牌 + 按钮式菜单（无 radio 圆点）+ 简短帮助。
+    返回当前 nav key。
+    """
+    valid = {item["key"] for item in _NAV_ITEMS}
+    if st.session_state.get("app_nav") not in valid:
+        st.session_state["app_nav"] = _NAV_NARRATION
+    current = st.session_state["app_nav"]
+
+    with st.sidebar:
+        st.markdown(
+            ui_styles.side_brand_html(name="NarratoAI", tag="一站式影视创作"),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            ui_styles.side_section_html("开始创作"),
+            unsafe_allow_html=True,
+        )
+
+        for item in _NAV_ITEMS:
+            is_active = item["key"] == current
+            # 当前=secondary（浅底深字），未选=tertiary；不用 primary，避免紫底白字
+            # 不用 disabled：Streamlit 禁用态会把字洗灰，可读性差
+            st.button(
+                item["label"],
+                key=f"nav_btn_{item['key']}",
+                type="secondary" if is_active else "tertiary",
+                use_container_width=True,
+                help=item["hint"],
+                icon=item.get("icon"),
+                on_click=_set_app_nav,
+                args=(item["key"],),
+            )
+
+        st.markdown(
+            f'<p class="na-nav-hint">{_NAV_BY_KEY[current]["hint"]}</p>',
+            unsafe_allow_html=True,
+        )
+
+        st.divider()
+        st.caption(f"v{config.project_version or '—'}")
+
+        with st.expander("帮助", expanded=False):
+            st.markdown(get_help_text())
+
+    return st.session_state["app_nav"]
 
 
 VIDEO_GENERATION_STEP_LABELS = [
@@ -668,78 +753,135 @@ def render_export_jianying_button():
     _render_jianying_export_status()
 
 
-
-def _render_app_header():
-    """中文优先的顶部标题区。"""
+def _render_page_chrome(nav: str) -> None:
+    """主区顶：路径条 + 页头 + 步骤引导（降低门槛）。"""
+    item = _NAV_BY_KEY.get(nav) or _NAV_ITEMS[0]
     st.markdown(
-        ui_styles.hero_html(
-            title=tr("App Title"),
-            subtitle=tr("App Subtitle"),
-            version=str(config.project_version or ""),
-            chips=["影视解说", "短剧混剪", "跨境本地化"],
-        ),
+        ui_styles.topbar_html(path=item["path"]),
         unsafe_allow_html=True,
     )
-    with st.expander(tr("About and Help"), expanded=False):
-        st.markdown(get_help_text())
+
+    if nav == _NAV_NARRATION:
+        st.markdown(
+            ui_styles.page_head_html(
+                title="影视解说",
+                description="上传视频，写好脚本，选好配音，一键成片。",
+                kicker="工作台",
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            ui_styles.steps_html(["准备脚本", "选配音", "生成成片"]),
+            unsafe_allow_html=True,
+        )
+    elif nav == _NAV_CROSS_BORDER:
+        st.markdown(
+            ui_styles.page_head_html(
+                title="跨境本地化",
+                description="上传视频 → 翻译字幕 → 可选配音 → 导出成片。支持中英日等多语。",
+                kicker="工作台",
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            ui_styles.steps_html(["上传视频", "翻译字幕", "导出成片"]),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            ui_styles.page_head_html(
+                title="设置",
+                description="配置模型与系统。日常成片可不改；配好 API Key 更稳。",
+                kicker="系统",
+            ),
+            unsafe_allow_html=True,
+        )
 
 
 def _render_narration_workspace():
-    """影视 / 短剧解说工作台：脚本 · 配音 · 画面字幕 + 成片操作。"""
-    st.markdown(
-        ui_styles.guide_html(
-            f"<strong>三步成片</strong>：左侧准备脚本 → 中间选配音 → 右侧设画面与字幕 → 底部一键生成。"
-            f"<br/>{escape(tr('Workflow Guide Narration'))}"
-        ),
-        unsafe_allow_html=True,
-    )
-
-    panel = st.columns([1.15, 1, 1])
+    """影视解说：三区模块 + 底部操作坞。"""
+    panel = st.columns([1.15, 1, 1], gap="medium")
     with panel[0]:
-        st.markdown(
-            ui_styles.col_title_html(tr("Script Column Panel")),
-            unsafe_allow_html=True,
-        )
-        script_settings.render_script_panel(tr)
+        with st.container(border=True):
+            st.markdown(
+                ui_styles.zone_head_html(
+                    tr("Script Column Panel"),
+                    hint="先做这一步",
+                ),
+                unsafe_allow_html=True,
+            )
+            script_settings.render_script_panel(tr)
     with panel[1]:
-        st.markdown(
-            ui_styles.col_title_html(tr("Audio Column Panel")),
-            unsafe_allow_html=True,
-        )
-        audio_settings.render_audio_panel(tr)
+        with st.container(border=True):
+            st.markdown(
+                ui_styles.zone_head_html(
+                    tr("Audio Column Panel"),
+                    hint="音色与 BGM",
+                ),
+                unsafe_allow_html=True,
+            )
+            audio_settings.render_audio_panel(tr)
     with panel[2]:
-        st.markdown(
-            ui_styles.col_title_html(tr("Video Column Panel")),
-            unsafe_allow_html=True,
-        )
-        video_settings.render_video_panel(tr)
-        subtitle_settings.render_subtitle_panel(tr)
+        with st.container(border=True):
+            st.markdown(
+                ui_styles.zone_head_html(
+                    tr("Video Column Panel"),
+                    hint="画幅与字幕",
+                ),
+                unsafe_allow_html=True,
+            )
+            video_settings.render_video_panel(tr)
+            subtitle_settings.render_subtitle_panel(tr)
 
     st.markdown(
-        ui_styles.action_bar_html(
-            tr("Action Bar Title"),
-            tr("Action Bar Hint"),
+        ui_styles.dock_html(
+            title="生成成片",
+            hint="确认上面三步后，点这里生成视频，或导出到剪映精修。",
         ),
         unsafe_allow_html=True,
     )
-    action_cols = st.columns([1, 1, 0.4])
+    action_cols = st.columns([1, 1, 0.4], gap="medium")
     with action_cols[0]:
         render_generate_button()
     with action_cols[1]:
         render_export_jianying_button()
 
 
+def _render_cross_border_workspace():
+    """跨境本地化工作区。"""
+    cross_border_panel.render_cross_border_panel(tr)
+
+
+def _render_settings_workspace():
+    """基础配置 + 系统。"""
+    left, right = st.columns([1.2, 1], gap="medium")
+    with left:
+        with st.container(border=True):
+            st.markdown(
+                ui_styles.zone_head_html("基础配置", hint="模型 · 语言 · 代理"),
+                unsafe_allow_html=True,
+            )
+            basic_settings.render_basic_settings(tr)
+    with right:
+        with st.container(border=True):
+            st.markdown(
+                ui_styles.zone_head_html("系统与引擎", hint="FFmpeg · 诊断"),
+                unsafe_allow_html=True,
+            )
+            system_settings.render_system_panel(tr)
+
+
 def main():
-    """主函数：中文优先、按工作流分 Tab，降低一屏信息密度。"""
+    """主函数：侧栏主导航 + 页面壳（页头 / 模块区 / 操作坞）。"""
     init_log()
     init_global_state()
 
-    # ===== 显式注册 LLM 提供商（最佳实践）=====
-    if 'llm_providers_registered' not in st.session_state:
+    # ===== 显式注册 LLM 提供商（仅一次）=====
+    if not st.session_state.get("llm_providers_registered"):
         try:
             from app.services.llm.providers import register_all_providers
             register_all_providers()
-            st.session_state['llm_providers_registered'] = True
+            st.session_state["llm_providers_registered"] = True
             logger.info("LLM 提供商注册成功")
         except Exception as e:
             logger.error(f"LLM 提供商注册失败: {str(e)}")
@@ -747,61 +889,35 @@ def main():
             logger.error(traceback.format_exc())
             st.error(tr("LLM initialization failed").format(error=str(e)))
 
-    # 检测FFmpeg硬件加速，但只打印一次日志
-    if 'hwaccel_logged' not in st.session_state:
-        st.session_state['hwaccel_logged'] = False
-
-    hwaccel_info = ffmpeg_utils.detect_hardware_acceleration()
-    if not st.session_state['hwaccel_logged']:
-        if hwaccel_info["available"]:
+    # 硬件加速探测较慢，session 内只做一次
+    if "hwaccel_info" not in st.session_state:
+        st.session_state["hwaccel_info"] = ffmpeg_utils.detect_hardware_acceleration()
+        info = st.session_state["hwaccel_info"]
+        if info.get("available"):
             logger.info(
-                f"FFmpeg硬件加速检测结果: 可用 | 类型: {hwaccel_info['type']} | "
-                f"编码器: {hwaccel_info['encoder']} | 独立显卡: {hwaccel_info['is_dedicated_gpu']}"
+                f"FFmpeg硬件加速检测结果: 可用 | 类型: {info['type']} | "
+                f"编码器: {info['encoder']} | 独立显卡: {info['is_dedicated_gpu']}"
             )
         else:
-            logger.warning(f"FFmpeg硬件加速不可用: {hwaccel_info['message']}, 将使用CPU软件编码")
-        st.session_state['hwaccel_logged'] = True
+            logger.warning(f"FFmpeg硬件加速不可用: {info.get('message')}, 将使用CPU软件编码")
 
-    try:
-        utils.init_resources()
-    except Exception as e:
-        logger.warning(f"资源初始化时出现警告: {e}")
+    # 资源初始化只做一次
+    if not st.session_state.get("resources_inited"):
+        try:
+            utils.init_resources()
+        except Exception as e:
+            logger.warning(f"资源初始化时出现警告: {e}")
+        st.session_state["resources_inited"] = True
 
-    _render_app_header()
+    nav = _render_sidebar_shell()
+    _render_page_chrome(nav)
 
-    tab_narration, tab_cross_border, tab_settings = st.tabs(
-        [
-            tr("Workflow Tab Narration"),
-            tr("Workflow Tab Cross Border"),
-            tr("Workflow Tab Settings"),
-        ]
-    )
-
-    with tab_narration:
+    if nav == _NAV_NARRATION:
         _render_narration_workspace()
-
-    with tab_cross_border:
-        st.markdown(
-            ui_styles.guide_html(
-                f"<strong>最快路径</strong>：上传视频 → 自动识别台词 → 翻译 → 烧字幕成片。"
-                f"<br/>{escape(tr('Workflow Guide Cross Border'))}"
-            ),
-            unsafe_allow_html=True,
-        )
-        # 独立 Tab，不再沉在页面底部
-        cross_border_panel.render_cross_border_panel(tr)
-
-    with tab_settings:
-        st.markdown(
-            ui_styles.guide_html(
-                "<strong>基础与系统</strong>：模型 / 语言 / 代理 / 缓存。日常成片不改也能跑；"
-                "配 API Key 后解说与翻译更稳。"
-            ),
-            unsafe_allow_html=True,
-        )
-        basic_settings.render_basic_settings(tr)
-        # 系统设置自带 expander，避免与解说工作台重复拥挤
-        system_settings.render_system_panel(tr)
+    elif nav == _NAV_CROSS_BORDER:
+        _render_cross_border_workspace()
+    else:
+        _render_settings_workspace()
 
 
 if __name__ == "__main__":

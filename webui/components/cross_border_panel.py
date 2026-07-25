@@ -114,7 +114,7 @@ _MODE_CN = {
     "narration": "解说文案工厂",
 }
 
-_SUBNAV_OPTIONS = ("① 新建任务", "② 任务详情", "③ 任务列表")
+_SUBNAV_OPTIONS = ("新建任务", "任务详情", "任务列表")
 
 
 def _task_mode(meta: Dict[str, Any]) -> str:
@@ -438,7 +438,13 @@ def _render_live_subtitle_nodes(meta: Dict[str, Any], *, running: bool) -> None:
                 unsafe_allow_html=True,
             )
 
-    st.markdown("##### 字幕节点")
+    st.markdown(
+        ui_styles.section_html(
+            "字幕节点",
+            "源字幕与目标字幕对照 · 翻译过程中目标节点会逐步变为已译",
+        ),
+        unsafe_allow_html=True,
+    )
     if want_auto and hasattr(st, "fragment"):
         # 局部刷新：长任务 3s 足够，比 2s 更省 CPU；只重绘本块
         @st.fragment(run_every=3)
@@ -470,9 +476,16 @@ def _maybe_auto_refresh(task_id: str) -> None:
 
 def _render_create_form(tr):
     st.markdown(
+        ui_styles.section_html(
+            "新建本地化任务",
+            "从素材到成片：取片 → 识别 → 翻译 → 烧录 / 配音",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
         ui_styles.card_html(
-            _tr(tr, "Cross-border Localization", "新建本地化任务"),
-            "本地上传或粘贴公开视频链接 → 自动识别台词 → 翻译 → 烧字幕成片。有现成字幕可一并上传，跳过识别。",
+            _tr(tr, "Cross-border Localization", "跨境本地化"),
+            "本地上传或粘贴公开视频链接 → 自动识别台词 → 翻译 → 烧字幕成片。有现成字幕可一并上传，跳过识别。多语语对可选（含日语等）。",
             body_html=ui_styles.pipeline_steps_html(
                 [
                     ("upload", "取片"),
@@ -487,25 +500,28 @@ def _render_create_form(tr):
         unsafe_allow_html=True,
     )
 
-    # 第一步：选路径（默认推荐）
-    mode_label = st.radio(
-        "① 选择模式",
-        options=[
-            "字幕本地化（推荐）",
-            "多语配音（实验）",
-            "解说文案工厂（高级）",
-        ],
-        horizontal=True,
+    # 第一步：选路径（segmented，无 radio 圆点）
+    _mode_opts = [
+        "字幕本地化（推荐）",
+        "多语配音（实验）",
+        "解说文案工厂（高级）",
+    ]
+    if st.session_state.get("cb_mode_label") not in _mode_opts:
+        st.session_state["cb_mode_label"] = _mode_opts[0]
+    mode_label = st.segmented_control(
+        "选择模式",
+        options=_mode_opts,
         key="cb_mode_label",
+        required=True,
         help=(
             "字幕本地化 = 识别 + 翻译 + 烧字幕（保留原声）；"
             "多语配音 = 分离人声 + 目标语 TTS + 混音 + 烧字幕；"
             "解说文案工厂 = 重写解说 + TTS + 剪辑。"
         ),
-    )
-    if mode_label.startswith("字幕"):
+    ) or _mode_opts[0]
+    if str(mode_label).startswith("字幕"):
         mode = "subtitle"
-    elif mode_label.startswith("多语"):
+    elif str(mode_label).startswith("多语"):
         mode = "dubbing"
     else:
         mode = "narration"
@@ -526,7 +542,7 @@ def _render_create_form(tr):
         st.session_state["cb_lang_pair"] = "en|zh"
 
     pair_key = st.selectbox(
-        "② 语对（源语言 → 目标语言）",
+        "语对（源语言 → 目标语言）",
         options=pair_keys,
         format_func=lambda k: pair_label_map.get(k, k),
         key="cb_lang_pair",
@@ -636,14 +652,17 @@ def _render_create_form(tr):
         f"**{voices_mod.translate_language_name(target_lang)}**）"
     )
 
-    st.markdown("**③ 准备素材**")
-    source_mode = st.radio(
+    st.markdown("**准备素材**")
+    _src_opts = ["本地上传", "链接下载"]
+    if st.session_state.get("cb_source_mode") not in _src_opts:
+        st.session_state["cb_source_mode"] = _src_opts[0]
+    source_mode = st.segmented_control(
         "素材来源",
-        options=["本地上传", "链接下载"],
-        horizontal=True,
+        options=_src_opts,
         key="cb_source_mode",
+        required=True,
         help="本地上传：本机视频文件。链接下载：粘贴 YouTube 等公开链接，用 yt-dlp 取片（需网络/代理）。",
-    )
+    ) or _src_opts[0]
 
     uploaded = None
     source_url = ""
@@ -1091,7 +1110,7 @@ def _render_create_form(tr):
         asr_backend = "auto"
 
     # 解说工厂专属（不要覆盖配音 expander 已写入的 voice_name / tts_engine）
-    # source_lang / target_lang / direction 已在上方「② 语对」确定，这里不再强制 en↔zh
+    # source_lang / target_lang / direction 已在上方「语对」确定，这里不再强制 en↔zh
     style_pack = DEFAULT_BY_DIRECTION.get(direction) or DEFAULT_BY_DIRECTION["inbound"]
     duration_mode = "keep"
     original_audio_ratio = 30 if direction == "inbound" else 20
@@ -1158,7 +1177,7 @@ def _render_create_form(tr):
         st.caption(
             f"当前语对：**{source_lang} → {target_lang}**"
             f"（{('引入' if direction == 'inbound' else '出海')}）。"
-            " 要换语种请回上方「② 语对」；此处可手改 ISO 码（如 ja / ko / es）。"
+            " 要换语种请回上方「语对」；此处可手改 ISO 码（如 ja / ko / es）。"
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -1422,7 +1441,7 @@ def _render_create_form(tr):
 
         task_store.save_meta(meta)
         st.session_state["cb_task_id"] = task_id
-        st.session_state["cb_pending_subnav"] = "② 任务详情"
+        st.session_state["cb_pending_subnav"] = "任务详情"
 
         if mode in {"subtitle", "dubbing"}:
             # 字幕 / 配音：跑完全程
@@ -1463,10 +1482,26 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
     task_id = meta.get("task_id") or ""
     label = _task_label(meta)
     mode = _task_mode(meta)
-    st.markdown(f"### {label}")
-    st.caption(f"内部编号 `{task_id}` · {_MODE_CN.get(mode, mode)}")
-    st.markdown(_status_badge(meta), unsafe_allow_html=True)
-    st.markdown(f"**{_tr(tr, 'Pipeline Progress', '流水线进度')}**")
+    from html import escape as _esc
+
+    st.markdown(
+        ui_styles.detail_head_html(
+            title=label,
+            meta_line=(
+                f"内部编号 <span class='narrato-mono'>{_esc(task_id)}</span>"
+                f" · {_esc(_MODE_CN.get(mode, mode))}"
+            ),
+            badge_html=_status_badge(meta),
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        ui_styles.section_html(
+            _tr(tr, "Pipeline Progress", "流水线进度"),
+            "步骤状态会随后台任务更新，点「刷新状态」同步",
+        ),
+        unsafe_allow_html=True,
+    )
     _render_pipeline_progress(meta)
 
     running = cb_pipeline.is_running(task_id)
@@ -2089,14 +2124,19 @@ def _render_task_detail(tr, meta: Dict[str, Any]):
 
 
 def _render_task_list(tr):
-    st.markdown("### 任务列表")
-    st.caption("最近 30 条跨境任务。点「加载选中任务」进入详情。")
+    st.markdown(
+        ui_styles.section_html(
+            "任务列表",
+            "最近 30 条跨境任务 · 选择后进入详情查看进度与成片",
+        ),
+        unsafe_allow_html=True,
+    )
     rows = task_store.list_tasks(limit=30)
     if not rows:
         st.markdown(
             ui_styles.empty_html(
                 "还没有跨境任务",
-                "切换到「① 新建任务」，上传视频即可开始字幕本地化。",
+                "切换到「新建任务」，上传视频即可开始字幕本地化。",
             ),
             unsafe_allow_html=True,
         )
@@ -2138,7 +2178,7 @@ def _render_task_list(tr):
     )
     if st.button("加载选中任务", key="cb_load_selected", type="primary", use_container_width=True):
         st.session_state["cb_task_id"] = selected
-        st.session_state["cb_pending_subnav"] = "② 任务详情"
+        st.session_state["cb_pending_subnav"] = "任务详情"
         _safe_rerun()
 
 
@@ -2162,11 +2202,7 @@ def render_cross_border_panel(tr=None):
 
 
 def _render_cross_border_panel_inner(tr=None):
-    st.caption(
-        "默认路径：翻译 + 烧字幕（对齐 VideoLingo）。"
-        " 也可切到解说文案工厂。语对锁定 en↔zh。"
-    )
-
+    # 页头由 webui.py 的 App Shell 统一渲染；此处只保留模块区内容
     meta = _load_selected_meta()
     if meta:
         s = meta.get("status") or "draft"
@@ -2184,34 +2220,43 @@ def _render_cross_border_panel_inner(tr=None):
             unsafe_allow_html=True,
         )
 
-    # pending 必须在 radio 实例化之前写入，否则 StreamlitAPIException
+    # pending 必须在 segmented 实例化之前写入，否则 StreamlitAPIException
     pending = st.session_state.pop("cb_pending_subnav", None)
     if pending in _SUBNAV_OPTIONS:
         st.session_state["cb_subnav"] = pending
     elif "cb_subnav" not in st.session_state:
-        st.session_state["cb_subnav"] = "① 新建任务"
+        st.session_state["cb_subnav"] = "新建任务"
     if meta and st.session_state.get("cb_prefer_detail_once"):
-        st.session_state["cb_subnav"] = "② 任务详情"
+        st.session_state["cb_subnav"] = "任务详情"
         st.session_state["cb_prefer_detail_once"] = False
-    # 非法值回落，防止 options 变更后 key 残留导致 DOM 异常
+    # 兼容旧 session 值（带圈号）并回落非法值
+    _legacy_subnav = {
+        "① 新建任务": "新建任务",
+        "② 任务详情": "任务详情",
+        "③ 任务列表": "任务列表",
+    }
+    cur_sub = st.session_state.get("cb_subnav")
+    if cur_sub in _legacy_subnav:
+        st.session_state["cb_subnav"] = _legacy_subnav[cur_sub]
     if st.session_state.get("cb_subnav") not in _SUBNAV_OPTIONS:
-        st.session_state["cb_subnav"] = "① 新建任务"
+        st.session_state["cb_subnav"] = "新建任务"
 
-    subnav = st.radio(
+    # 二级分段导航：segmented_control（无 radio 圆点、无序号）
+    subnav = st.segmented_control(
         "跨境子页面",
         options=list(_SUBNAV_OPTIONS),
-        horizontal=True,
         key="cb_subnav",
+        required=True,
         label_visibility="collapsed",
-        help="① 新建 · ② 查看进度与成片 · ③ 历史任务",
-    )
+        help="新建 · 查看进度与成片 · 历史任务",
+    ) or "新建任务"
 
-    if subnav == "① 新建任务":
+    if subnav == "新建任务":
         _render_create_form(tr)
-    elif subnav == "② 任务详情":
+    elif subnav == "任务详情":
         meta = _load_selected_meta()
         if not meta:
-            st.info("尚未选择任务。请先在「① 新建任务」开始，或从「③ 任务列表」加载。")
+            st.info("尚未选择任务。请先在「新建任务」开始，或从「任务列表」加载。")
         else:
             _render_task_detail(tr, meta)
     else:
